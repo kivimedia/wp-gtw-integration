@@ -3,7 +3,7 @@
  * Plugin Name: WP-GTW Integration
  * Plugin URI:  https://github.com/kivimedia/wp-gtw-integration
  * Description: WordPress to GoToWebinar integration - auto-detects upcoming sessions, registers via WPForms, replaces Zapier.
- * Version:     1.2.0
+ * Version:     1.3.0
  * Author:      Kivi Media
  * Author URI:  https://kivimedia.co
  * License:     GPL-2.0-or-later
@@ -16,7 +16,7 @@ if ( ! defined( 'ABSPATH' ) ) {
     exit;
 }
 
-define( 'WP_GTW_VERSION', '1.2.0' );
+define( 'WP_GTW_VERSION', '1.3.0' );
 define( 'WP_GTW_PATH', plugin_dir_path( __FILE__ ) );
 define( 'WP_GTW_URL', plugin_dir_url( __FILE__ ) );
 
@@ -85,6 +85,70 @@ function wp_gtw_activate() {
     }
 }
 register_activation_hook( __FILE__, 'wp_gtw_activate' );
+
+/**
+ * REST API endpoints for remote debugging and configuration.
+ */
+add_action( 'rest_api_init', function() {
+    register_rest_route( 'wp-gtw/v1', '/debug', array(
+        'methods'             => 'GET',
+        'callback'            => function() {
+            $api = new GTW_API();
+            $token = $api->get_token();
+            $org_key = $api->get_organizer_key();
+
+            $debug = array(
+                'has_token'     => ! empty( $token ),
+                'token_prefix'  => $token ? substr( $token, 0, 10 ) . '...' : null,
+                'organizer_key' => $org_key ?: null,
+                'is_connected'  => $api->is_connected(),
+            );
+
+            // Try known GoTo API endpoints to find the organizer
+            if ( $token ) {
+                $endpoints = array(
+                    'admin_me'       => 'https://api.getgo.com/admin/rest/v1/me',
+                    'admin_accounts' => 'https://api.getgo.com/admin/rest/v1/accounts',
+                    'g2w_account'    => 'https://api.getgo.com/G2W/rest/v2/account',
+                    'g2w_webinars'   => 'https://api.getgo.com/G2W/rest/v2/account/webinars',
+                );
+
+                foreach ( $endpoints as $name => $url ) {
+                    $resp = wp_remote_get( $url, array(
+                        'timeout' => 8,
+                        'headers' => array( 'Authorization' => 'Bearer ' . $token, 'Accept' => 'application/json' ),
+                    ) );
+                    $code = wp_remote_retrieve_response_code( $resp );
+                    $body = wp_remote_retrieve_body( $resp );
+                    $debug['endpoints'][ $name ] = array(
+                        'status' => $code,
+                        'body'   => json_decode( $body, true ) ?? substr( $body, 0, 500 ),
+                    );
+                }
+            }
+
+            return $debug;
+        },
+        'permission_callback' => function() {
+            return current_user_can( 'manage_options' );
+        },
+    ) );
+
+    register_rest_route( 'wp-gtw/v1', '/set-organizer', array(
+        'methods'             => 'POST',
+        'callback'            => function( $request ) {
+            $key = sanitize_text_field( $request->get_param( 'organizer_key' ) );
+            if ( empty( $key ) ) {
+                return new WP_Error( 'missing_key', 'organizer_key is required' );
+            }
+            update_option( 'wp_gtw_organizer_key', $key );
+            return array( 'success' => true, 'organizer_key' => $key );
+        },
+        'permission_callback' => function() {
+            return current_user_can( 'manage_options' );
+        },
+    ) );
+} );
 
 /**
  * Initialize the WPForms handler on every request.
