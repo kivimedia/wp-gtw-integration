@@ -134,11 +134,44 @@ class GTW_API {
             update_option( self::ORG_KEY, $org_key );
         }
 
-        // If no org key in token response, fetch it from /me
-        if ( empty( $org_key ) ) {
-            $me = $this->api_get( '/me' );
-            if ( $me['success'] && ! empty( $me['data']['key'] ) ) {
-                update_option( self::ORG_KEY, $me['data']['key'] );
+        // If no org key in token response, fetch it from admin API
+        if ( empty( get_option( self::ORG_KEY, '' ) ) ) {
+            $me_response = wp_remote_get( 'https://api.getgo.com/admin/rest/v1/me', array(
+                'timeout' => 10,
+                'headers' => array(
+                    'Authorization' => 'Bearer ' . $token,
+                    'Accept'        => 'application/json',
+                ),
+            ) );
+            if ( ! is_wp_error( $me_response ) ) {
+                $me_body = json_decode( wp_remote_retrieve_body( $me_response ), true );
+                $fetched_key = $me_body['key'] ?? $me_body['organizerKey'] ?? '';
+                if ( $fetched_key ) {
+                    update_option( self::ORG_KEY, $fetched_key );
+                }
+            }
+
+            // Fallback: try listing webinars to extract organizer key from the response
+            if ( empty( get_option( self::ORG_KEY, '' ) ) ) {
+                $acct_response = wp_remote_get( 'https://api.getgo.com/admin/rest/v1/accounts', array(
+                    'timeout' => 10,
+                    'headers' => array(
+                        'Authorization' => 'Bearer ' . $token,
+                        'Accept'        => 'application/json',
+                    ),
+                ) );
+                if ( ! is_wp_error( $acct_response ) ) {
+                    $acct_body = json_decode( wp_remote_retrieve_body( $acct_response ), true );
+                    // Extract first account's organizer key
+                    if ( is_array( $acct_body ) ) {
+                        foreach ( $acct_body as $acct ) {
+                            if ( ! empty( $acct['key'] ) ) {
+                                update_option( self::ORG_KEY, $acct['key'] );
+                                break;
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -204,15 +237,43 @@ class GTW_API {
      */
     public function list_webinars(): array {
         $org_key = $this->get_organizer_key();
-        if ( empty( $org_key ) ) {
-            return array( 'success' => false, 'error' => 'No organizer key' );
+
+        // Try with organizer key first
+        if ( ! empty( $org_key ) ) {
+            $response = $this->api_get( "/organizers/{$org_key}/webinars" );
+            if ( $response['success'] ) {
+                return $this->parse_webinars_response( $response );
+            }
         }
 
-        $response = $this->api_get( "/organizers/{$org_key}/webinars" );
-        if ( ! $response['success'] ) {
-            return $response;
+        // Fallback: try the account-level webinars endpoint
+        $token = $this->get_token();
+        if ( ! $token ) {
+            return array( 'success' => false, 'error' => 'No access token' );
         }
 
+        // Try /admin/rest/v1/me to get the organizer key
+        $me_response = wp_remote_get( 'https://api.getgo.com/admin/rest/v1/me', array(
+            'timeout' => 10,
+            'headers' => array( 'Authorization' => 'Bearer ' . $token, 'Accept' => 'application/json' ),
+        ) );
+
+        if ( ! is_wp_error( $me_response ) ) {
+            $me_body = json_decode( wp_remote_retrieve_body( $me_response ), true );
+            $fetched_key = $me_body['key'] ?? $me_body['organizerKey'] ?? '';
+            if ( $fetched_key ) {
+                update_option( self::ORG_KEY, $fetched_key );
+                $response = $this->api_get( "/organizers/{$fetched_key}/webinars" );
+                if ( $response['success'] ) {
+                    return $this->parse_webinars_response( $response );
+                }
+            }
+        }
+
+        return array( 'success' => false, 'error' => 'Could not retrieve organizer key. Click "Test Connection" first, or contact GoTo support to verify your account has API access.' );
+    }
+
+    private function parse_webinars_response( array $response ): array {
         $webinars = array();
         $items = $response['data']['_embedded']['webinars'] ?? $response['data'] ?? array();
         if ( ! is_array( $items ) ) {

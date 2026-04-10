@@ -3,7 +3,7 @@
  * Plugin Name: WP-GTW Integration
  * Plugin URI:  https://github.com/kivimedia/wp-gtw-integration
  * Description: WordPress to GoToWebinar integration - auto-detects upcoming sessions, registers via WPForms, replaces Zapier.
- * Version:     1.0.0
+ * Version:     1.2.0
  * Author:      Kivi Media
  * Author URI:  https://kivimedia.co
  * License:     GPL-2.0-or-later
@@ -16,7 +16,7 @@ if ( ! defined( 'ABSPATH' ) ) {
     exit;
 }
 
-define( 'WP_GTW_VERSION', '1.0.0' );
+define( 'WP_GTW_VERSION', '1.2.0' );
 define( 'WP_GTW_PATH', plugin_dir_path( __FILE__ ) );
 define( 'WP_GTW_URL', plugin_dir_url( __FILE__ ) );
 
