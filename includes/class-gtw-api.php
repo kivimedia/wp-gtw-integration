@@ -1,18 +1,58 @@
 <?php
 /**
  * GoToWebinar API wrapper.
- * Handles OAuth 2.0, token management, session queries, and registration.
+ * Handles OAuth 2.0 Authorization Code flow, token management, session queries, and registration.
  */
 
 if ( ! defined( 'ABSPATH' ) ) exit;
 
 class GTW_API {
 
-    private const AUTH_URL  = 'https://authentication.logmeininc.com/oauth/token';
-    private const API_BASE  = 'https://api.getgo.com/G2W/rest/v2';
-    private const TOKEN_KEY = 'wp_gtw_access_token';
-    private const EXPIRY_KEY = 'wp_gtw_token_expiry';
-    private const ORG_KEY   = 'wp_gtw_organizer_key';
+    private const AUTH_URL    = 'https://authentication.logmeininc.com/oauth/authorize';
+    private const TOKEN_URL   = 'https://authentication.logmeininc.com/oauth/token';
+    private const API_BASE    = 'https://api.getgo.com/G2W/rest/v2';
+    private const TOKEN_KEY   = 'wp_gtw_access_token';
+    private const REFRESH_KEY = 'wp_gtw_refresh_token';
+    private const EXPIRY_KEY  = 'wp_gtw_token_expiry';
+    private const ORG_KEY     = 'wp_gtw_organizer_key';
+
+    /**
+     * Get the OAuth authorization URL (Step 1: redirect admin to GoTo login).
+     */
+    public function get_auth_url(): string {
+        $client_id = get_option( 'wp_gtw_client_id', '' );
+        $redirect  = admin_url( 'options-general.php?page=wp-gtw-settings' );
+
+        return self::AUTH_URL . '?' . http_build_query( array(
+            'response_type' => 'code',
+            'client_id'     => $client_id,
+            'redirect_uri'  => $redirect,
+        ) );
+    }
+
+    /**
+     * Exchange authorization code for tokens (Step 2: after GoTo redirects back).
+     */
+    public function exchange_code( string $code ): bool {
+        $client_id     = get_option( 'wp_gtw_client_id', '' );
+        $client_secret = get_option( 'wp_gtw_client_secret', '' );
+        $redirect      = admin_url( 'options-general.php?page=wp-gtw-settings' );
+
+        $response = wp_remote_post( self::TOKEN_URL, array(
+            'timeout' => 15,
+            'headers' => array(
+                'Content-Type'  => 'application/x-www-form-urlencoded',
+                'Authorization' => 'Basic ' . base64_encode( $client_id . ':' . $client_secret ),
+            ),
+            'body' => array(
+                'grant_type'   => 'authorization_code',
+                'code'         => $code,
+                'redirect_uri' => $redirect,
+            ),
+        ) );
+
+        return $this->handle_token_response( $response, 'exchange_code' );
+    }
 
     /**
      * Get a valid access token, refreshing if needed.
@@ -21,39 +61,54 @@ class GTW_API {
         $token  = get_option( self::TOKEN_KEY );
         $expiry = (int) get_option( self::EXPIRY_KEY, 0 );
 
-        // Refresh 5 minutes before expiry
+        // Token still valid (with 5 min buffer)
         if ( $token && $expiry > ( time() + 300 ) ) {
             return $token;
         }
 
-        return $this->authenticate();
+        // Try refresh
+        $refreshed = $this->refresh_token();
+        if ( $refreshed ) {
+            return get_option( self::TOKEN_KEY );
+        }
+
+        return null;
     }
 
     /**
-     * Authenticate with GoToWebinar OAuth (Client Credentials grant).
+     * Refresh the access token using the stored refresh token.
      */
-    public function authenticate(): ?string {
+    private function refresh_token(): bool {
+        $refresh_token = get_option( self::REFRESH_KEY, '' );
         $client_id     = get_option( 'wp_gtw_client_id', '' );
         $client_secret = get_option( 'wp_gtw_client_secret', '' );
 
-        if ( empty( $client_id ) || empty( $client_secret ) ) {
-            return null;
+        if ( empty( $refresh_token ) || empty( $client_id ) || empty( $client_secret ) ) {
+            return false;
         }
 
-        $response = wp_remote_post( self::AUTH_URL, array(
-            'timeout' => 10,
+        $response = wp_remote_post( self::TOKEN_URL, array(
+            'timeout' => 15,
             'headers' => array(
                 'Content-Type'  => 'application/x-www-form-urlencoded',
                 'Authorization' => 'Basic ' . base64_encode( $client_id . ':' . $client_secret ),
             ),
             'body' => array(
-                'grant_type' => 'client_credentials',
+                'grant_type'    => 'refresh_token',
+                'refresh_token' => $refresh_token,
             ),
         ) );
 
+        return $this->handle_token_response( $response, 'refresh_token' );
+    }
+
+    /**
+     * Handle token response from either exchange or refresh.
+     */
+    private function handle_token_response( $response, string $context ): bool {
         if ( is_wp_error( $response ) ) {
-            GTW_Logger::log_api_error( 'auth', $response->get_error_message() );
-            return null;
+            GTW_Logger::log_api_error( $context, $response->get_error_message() );
+            return false;
         }
 
         $code = wp_remote_retrieve_response_code( $response );
@@ -61,21 +116,50 @@ class GTW_API {
 
         if ( $code !== 200 || empty( $body['access_token'] ) ) {
             $error = $body['error_description'] ?? $body['error'] ?? "HTTP {$code}";
-            GTW_Logger::log_api_error( 'auth', $error );
-            return null;
+            GTW_Logger::log_api_error( $context, $error );
+            return false;
         }
 
-        $token     = $body['access_token'];
-        $expires_in = (int) ( $body['expires_in'] ?? 3600 );
-        $org_key   = $body['organizer_key'] ?? '';
+        $token       = $body['access_token'];
+        $refresh     = $body['refresh_token'] ?? '';
+        $expires_in  = (int) ( $body['expires_in'] ?? 3600 );
+        $org_key     = $body['organizer_key'] ?? '';
 
         update_option( self::TOKEN_KEY, $token );
         update_option( self::EXPIRY_KEY, time() + $expires_in );
+        if ( $refresh ) {
+            update_option( self::REFRESH_KEY, $refresh );
+        }
         if ( $org_key ) {
             update_option( self::ORG_KEY, $org_key );
         }
 
-        return $token;
+        // If no org key in token response, fetch it from /me
+        if ( empty( $org_key ) ) {
+            $me = $this->api_get( '/me' );
+            if ( $me['success'] && ! empty( $me['data']['key'] ) ) {
+                update_option( self::ORG_KEY, $me['data']['key'] );
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * Check if we have a valid connection (has refresh token).
+     */
+    public function is_connected(): bool {
+        return ! empty( get_option( self::REFRESH_KEY, '' ) );
+    }
+
+    /**
+     * Disconnect - clear all tokens.
+     */
+    public function disconnect(): void {
+        delete_option( self::TOKEN_KEY );
+        delete_option( self::REFRESH_KEY );
+        delete_option( self::EXPIRY_KEY );
+        delete_option( self::ORG_KEY );
     }
 
     /**
@@ -91,12 +175,12 @@ class GTW_API {
     public function test_connection(): array {
         $token = $this->get_token();
         if ( ! $token ) {
-            return array( 'success' => false, 'error' => 'Authentication failed. Check your Client ID and Secret.' );
+            return array( 'success' => false, 'error' => 'No access token. Connect to GoToWebinar first.' );
         }
 
         $org_key = $this->get_organizer_key();
         if ( empty( $org_key ) ) {
-            return array( 'success' => false, 'error' => 'No organizer key found. Re-authenticate.' );
+            return array( 'success' => false, 'error' => 'No organizer key found. Reconnect to GoToWebinar.' );
         }
 
         $response = $this->api_get( "/organizers/{$org_key}" );
@@ -116,6 +200,37 @@ class GTW_API {
     }
 
     /**
+     * List all webinars for the organizer (for picking the series key).
+     */
+    public function list_webinars(): array {
+        $org_key = $this->get_organizer_key();
+        if ( empty( $org_key ) ) {
+            return array( 'success' => false, 'error' => 'No organizer key' );
+        }
+
+        $response = $this->api_get( "/organizers/{$org_key}/webinars" );
+        if ( ! $response['success'] ) {
+            return $response;
+        }
+
+        $webinars = array();
+        $items = $response['data']['_embedded']['webinars'] ?? $response['data'] ?? array();
+        if ( ! is_array( $items ) ) {
+            $items = array();
+        }
+
+        foreach ( $items as $w ) {
+            $webinars[] = array(
+                'webinarKey' => $w['webinarKey'] ?? '',
+                'subject'    => $w['subject'] ?? 'Untitled',
+                'times'      => $w['times'] ?? array(),
+            );
+        }
+
+        return array( 'success' => true, 'webinars' => $webinars );
+    }
+
+    /**
      * Get upcoming sessions for a webinar key.
      */
     public function get_webinar_sessions( string $webinar_key ): array {
@@ -124,29 +239,31 @@ class GTW_API {
             return array( 'success' => false, 'error' => 'No organizer key' );
         }
 
+        // Try sessions endpoint first
         $response = $this->api_get( "/organizers/{$org_key}/webinars/{$webinar_key}/sessions" );
-        if ( ! $response['success'] ) {
-            // Fallback: try getting webinar info which includes sessions
-            $webinar_response = $this->api_get( "/organizers/{$org_key}/webinars/{$webinar_key}" );
-            if ( $webinar_response['success'] && ! empty( $webinar_response['data']['times'] ) ) {
-                return array(
-                    'success'  => true,
-                    'sessions' => $webinar_response['data']['times'],
-                    'source'   => 'webinar_times',
-                );
-            }
-            return $response;
+        if ( $response['success'] && ! empty( $response['data'] ) ) {
+            return array(
+                'success'  => true,
+                'sessions' => $response['data'],
+                'source'   => 'sessions_endpoint',
+            );
         }
 
-        return array(
-            'success'  => true,
-            'sessions' => $response['data'] ?? array(),
-            'source'   => 'sessions_endpoint',
-        );
+        // Fallback: get webinar info which includes scheduled times
+        $webinar_response = $this->api_get( "/organizers/{$org_key}/webinars/{$webinar_key}" );
+        if ( $webinar_response['success'] && ! empty( $webinar_response['data']['times'] ) ) {
+            return array(
+                'success'  => true,
+                'sessions' => $webinar_response['data']['times'],
+                'source'   => 'webinar_times',
+            );
+        }
+
+        return array( 'success' => false, 'error' => 'No sessions found for this webinar' );
     }
 
     /**
-     * Register an attendee to a webinar session.
+     * Register an attendee to a webinar.
      */
     public function register_attendee( string $webinar_key, string $session_key, array $registrant ): array {
         $org_key = $this->get_organizer_key();
@@ -167,12 +284,10 @@ class GTW_API {
             $body['organization'] = $registrant['organization'];
         }
 
-        $response = $this->api_post(
+        return $this->api_post(
             "/organizers/{$org_key}/webinars/{$webinar_key}/registrants",
             $body
         );
-
-        return $response;
     }
 
     /**

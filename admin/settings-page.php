@@ -96,13 +96,46 @@ add_action( 'wp_ajax_wp_gtw_save_series', function() {
     wp_send_json( array( 'success' => true, 'id' => $series_id ) );
 } );
 
+// Handle AJAX: list webinars from GTW account
+add_action( 'wp_ajax_wp_gtw_list_webinars', function() {
+    check_ajax_referer( 'wp_gtw_nonce', 'nonce' );
+    if ( ! current_user_can( 'manage_options' ) ) wp_die( 'Unauthorized' );
+
+    $api    = new GTW_API();
+    $result = $api->list_webinars();
+    wp_send_json( $result );
+} );
+
+// Handle AJAX: disconnect
+add_action( 'wp_ajax_wp_gtw_disconnect', function() {
+    check_ajax_referer( 'wp_gtw_nonce', 'nonce' );
+    if ( ! current_user_can( 'manage_options' ) ) wp_die( 'Unauthorized' );
+
+    $api = new GTW_API();
+    $api->disconnect();
+    wp_send_json( array( 'success' => true ) );
+} );
+
 /**
  * Render the settings page.
  */
 function wp_gtw_settings_page() {
+    // Handle OAuth callback (GoTo redirects back with ?code=...)
+    if ( isset( $_GET['code'] ) && ! empty( $_GET['code'] ) ) {
+        $api = new GTW_API();
+        $success = $api->exchange_code( sanitize_text_field( $_GET['code'] ) );
+        if ( $success ) {
+            echo '<div class="notice notice-success"><p><strong>Connected to GoToWebinar successfully!</strong></p></div>';
+        } else {
+            echo '<div class="notice notice-error"><p><strong>Failed to connect.</strong> Check your Client ID and Secret, then try again.</p></div>';
+        }
+    }
+
     global $wpdb;
     $series_table = $wpdb->prefix . 'gtw_webinar_series';
     $series = $wpdb->get_row( "SELECT * FROM {$series_table} WHERE is_active = 1 LIMIT 1", ARRAY_A );
+    $api = new GTW_API();
+    $is_connected = $api->is_connected();
 
     $mapping = $series ? ( json_decode( $series['field_mapping'] ?? '{}', true ) ?: array() ) : array();
 
@@ -133,25 +166,37 @@ function wp_gtw_settings_page() {
             #gtw-connection-result { margin-top: 10px; }
         </style>
 
-        <!-- API Credentials -->
+        <!-- API Credentials & Connection -->
         <div class="gtw-card">
-            <h2>API Credentials</h2>
-            <form method="post" action="options.php">
-                <?php settings_fields( 'wp_gtw_settings' ); ?>
-                <table class="form-table">
-                    <tr>
-                        <th>Client ID</th>
-                        <td><input type="text" name="wp_gtw_client_id" value="<?php echo esc_attr( get_option( 'wp_gtw_client_id', '' ) ); ?>" class="regular-text" /></td>
-                    </tr>
-                    <tr>
-                        <th>Client Secret</th>
-                        <td><input type="password" name="wp_gtw_client_secret" value="<?php echo esc_attr( get_option( 'wp_gtw_client_secret', '' ) ); ?>" class="regular-text" /></td>
-                    </tr>
-                </table>
-                <?php submit_button( 'Save Credentials' ); ?>
-            </form>
-            <button class="button" id="gtw-test-btn">Test Connection</button>
-            <div id="gtw-connection-result"></div>
+            <h2>GoToWebinar Connection</h2>
+
+            <?php if ( $is_connected ) : ?>
+                <p><span class="gtw-status gtw-status-ok">Connected</span></p>
+                <button class="button" id="gtw-test-btn">Test Connection</button>
+                <button class="button" id="gtw-disconnect-btn" style="color:#dc3545;">Disconnect</button>
+                <div id="gtw-connection-result" style="margin-top:10px;"></div>
+            <?php else : ?>
+                <p>Enter your GoToWebinar OAuth credentials, save, then click Connect.</p>
+                <form method="post" action="options.php">
+                    <?php settings_fields( 'wp_gtw_settings' ); ?>
+                    <table class="form-table">
+                        <tr>
+                            <th>Client ID</th>
+                            <td><input type="text" name="wp_gtw_client_id" value="<?php echo esc_attr( get_option( 'wp_gtw_client_id', '' ) ); ?>" class="regular-text" /></td>
+                        </tr>
+                        <tr>
+                            <th>Client Secret</th>
+                            <td><input type="password" name="wp_gtw_client_secret" value="<?php echo esc_attr( get_option( 'wp_gtw_client_secret', '' ) ); ?>" class="regular-text" /></td>
+                        </tr>
+                    </table>
+                    <?php submit_button( 'Save Credentials' ); ?>
+                </form>
+                <?php if ( get_option( 'wp_gtw_client_id' ) ) : ?>
+                    <a href="<?php echo esc_url( $api->get_auth_url() ); ?>" class="button button-primary button-hero">Connect to GoToWebinar</a>
+                    <p class="description" style="margin-top:10px;">You'll be redirected to GoTo to log in. After approval, you'll return here automatically.</p>
+                <?php endif; ?>
+                <div id="gtw-connection-result" style="margin-top:10px;"></div>
+            <?php endif; ?>
         </div>
 
         <!-- Webinar Configuration -->
@@ -166,7 +211,9 @@ function wp_gtw_settings_page() {
                     <th>Webinar Key (Series Key)</th>
                     <td>
                         <input type="text" id="gtw-webinar-key" value="<?php echo esc_attr( $series['webinar_key'] ?? '' ); ?>" class="regular-text" />
-                        <p class="description">The webinar key from GoToWebinar (not the session ID).</p>
+                        <button type="button" class="button" id="gtw-list-webinars-btn" style="vertical-align:baseline;margin-left:8px;">Browse Webinars</button>
+                        <p class="description">The webinar key from GoToWebinar (not the session ID). Click "Browse Webinars" to pick from your account.</p>
+                        <div id="gtw-webinar-list" style="margin-top:10px;"></div>
                     </td>
                 </tr>
             </table>
@@ -258,6 +305,42 @@ function wp_gtw_settings_page() {
                         : '<span class="gtw-status gtw-status-error">Error: ' + (r.error || 'Unknown') + '</span>';
                     $('#gtw-connection-result').html(html);
                     $btn.prop('disabled', false).text('Test Connection');
+                });
+            });
+
+            // Disconnect
+            $('#gtw-disconnect-btn').on('click', function() {
+                if (!confirm('Disconnect from GoToWebinar? You will need to reconnect to resume registrations.')) return;
+                $.post(ajaxurl, { action: 'wp_gtw_disconnect', nonce: nonce }, function() {
+                    location.reload();
+                });
+            });
+
+            // List webinars
+            $('#gtw-list-webinars-btn').on('click', function() {
+                var $btn = $(this).prop('disabled', true).text('Loading...');
+                $.post(ajaxurl, { action: 'wp_gtw_list_webinars', nonce: nonce }, function(r) {
+                    $btn.prop('disabled', false).text('Browse Webinars');
+                    if (!r.success) {
+                        $('#gtw-webinar-list').html('<span class="gtw-status gtw-status-error">' + (r.error || 'Failed to load webinars') + '</span>');
+                        return;
+                    }
+                    var webinars = r.webinars || [];
+                    if (!webinars.length) {
+                        $('#gtw-webinar-list').html('<span class="gtw-status gtw-status-pending">No webinars found on this account</span>');
+                        return;
+                    }
+                    var html = '<table class="widefat striped" style="max-width:600px;"><thead><tr><th>Webinar</th><th>Key</th><th></th></tr></thead><tbody>';
+                    webinars.forEach(function(w) {
+                        html += '<tr><td>' + w.subject + '</td><td style="font-family:monospace;font-size:12px;">' + w.webinarKey + '</td>';
+                        html += '<td><button type="button" class="button button-small gtw-pick-webinar" data-key="' + w.webinarKey + '">Use This</button></td></tr>';
+                    });
+                    html += '</tbody></table>';
+                    $('#gtw-webinar-list').html(html);
+                    $('.gtw-pick-webinar').on('click', function() {
+                        $('#gtw-webinar-key').val($(this).data('key'));
+                        $('#gtw-webinar-list').html('<span class="gtw-status gtw-status-ok">Selected: ' + $(this).data('key') + '</span>');
+                    });
                 });
             });
 
