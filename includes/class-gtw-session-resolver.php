@@ -1,7 +1,7 @@
 <?php
 /**
  * Session Resolver - finds the next upcoming GoToWebinar session by name pattern.
- * Auto-creates new sessions when none are available.
+ * Auto-extends series by creating new sessions when running low.
  */
 
 if ( ! defined( 'ABSPATH' ) ) exit;
@@ -15,43 +15,34 @@ class GTW_Session_Resolver {
     }
 
     /**
-     * Get the upcoming session matching a name pattern.
-     * If no pattern given, falls back to webinar_key lookup.
+     * Get the next upcoming session matching a name pattern.
+     * Each registrant is registered to a SPECIFIC webinar (specific date).
+     * GoToWebinar handles confirmation + reminder emails for that date.
      *
-     * @param string $webinar_key  Legacy: specific webinar key (optional if pattern is set)
-     * @param string $name_pattern Substring to match in webinar subject (e.g., "30 in 30")
-     * @param array  $auto_create  Auto-create config: ['enabled' => bool, 'day' => 'monday', 'time' => '15:00', 'duration' => 30, 'timezone' => 'America/New_York']
-     * @return array|null Session data or null
+     * @return array|null Session data or null if none found
      */
     public function get_upcoming_session( string $webinar_key = '', string $name_pattern = '', array $auto_create = array() ): ?array {
-        // Check cache first
         $cache_key = $name_pattern ?: $webinar_key;
         $cached = $this->get_cached_session( $cache_key );
-        if ( $cached ) {
-            return $cached;
-        }
+        if ( $cached ) return $cached;
 
-        // Find session by name pattern (new approach)
         if ( ! empty( $name_pattern ) ) {
             $session = $this->find_by_pattern( $name_pattern );
             if ( $session ) {
                 $this->cache_session( $cache_key, $session );
                 return $session;
             }
-
-            // No session found - try auto-create if enabled
+            // No session found - if auto-create enabled, make one
             if ( ! empty( $auto_create['enabled'] ) ) {
-                $session = $this->auto_create_session( $name_pattern, $auto_create );
+                $session = $this->create_next_session( $name_pattern, $auto_create );
                 if ( $session ) {
                     $this->cache_session( $cache_key, $session );
                     return $session;
                 }
             }
-
             return null;
         }
 
-        // Legacy: find by specific webinar key
         if ( ! empty( $webinar_key ) ) {
             return $this->find_by_key( $webinar_key );
         }
@@ -60,82 +51,97 @@ class GTW_Session_Resolver {
     }
 
     /**
-     * Find the soonest future session whose subject contains the pattern.
+     * Count future sessions matching a name pattern.
+     * Used by the cron to decide when to auto-extend.
      */
-    private function find_by_pattern( string $pattern ): ?array {
+    public function count_upcoming_sessions( string $name_pattern ): int {
+        $all = $this->find_all_by_pattern( $name_pattern );
+        return count( $all );
+    }
+
+    /**
+     * Get all future sessions matching a pattern (for display and counting).
+     */
+    public function find_all_by_pattern( string $pattern ): array {
         $org_key = $this->api->get_organizer_key();
-        if ( empty( $org_key ) ) return null;
+        if ( empty( $org_key ) ) return array();
 
         $from = gmdate( 'Y-m-d\TH:i:s\Z' );
-        $to   = gmdate( 'Y-m-d\TH:i:s\Z', time() + 180 * 86400 ); // 6 months ahead
+        $to   = gmdate( 'Y-m-d\TH:i:s\Z', time() + 365 * 86400 );
 
         $response = $this->api->api_get_public( "/organizers/{$org_key}/webinars?fromTime={$from}&toTime={$to}" );
-        if ( ! $response['success'] ) return null;
+        if ( ! $response['success'] ) return array();
 
-        $all_webinars = $response['data']['_embedded']['webinars'] ?? $response['data'] ?? array();
-        if ( ! is_array( $all_webinars ) ) return null;
+        $all = $response['data']['_embedded']['webinars'] ?? $response['data'] ?? array();
+        if ( ! is_array( $all ) ) return array();
 
         $pattern_lower = strtolower( $pattern );
         $now = time();
-        $candidates = array();
+        $matches = array();
 
-        foreach ( $all_webinars as $w ) {
-            $subject = strtolower( $w['subject'] ?? '' );
-            if ( strpos( $subject, $pattern_lower ) === false ) continue;
-
+        foreach ( $all as $w ) {
+            if ( strpos( strtolower( $w['subject'] ?? '' ), $pattern_lower ) === false ) continue;
             $times = $w['times'] ?? array();
             if ( empty( $times ) ) continue;
 
             $start = strtotime( $times[0]['startTime'] ?? '' );
             $end   = strtotime( $times[0]['endTime'] ?? '' );
-
-            // Only future sessions (end time hasn't passed)
             if ( $end && $end > $now ) {
-                $candidates[] = array(
-                    'webinarKey'         => $w['webinarKey'] ?? '',
-                    'sessionKey'         => $w['webinarKey'] ?? '',
-                    'subject'            => $w['subject'] ?? '',
+                $matches[] = array(
+                    'webinarKey'         => $w['webinarKey'],
+                    'sessionKey'         => $w['webinarKey'],
+                    'subject'            => $w['subject'],
                     'startTime'          => $start,
                     'endTime'            => $end,
                     'startTimeFormatted' => gmdate( 'Y-m-d H:i:s', $start ),
                     'endTimeFormatted'   => gmdate( 'Y-m-d H:i:s', $end ),
                     'recurrenceKey'      => $w['recurrenceKey'] ?? null,
-                    'recurrenceType'     => $w['recurrenceType'] ?? 'single',
                 );
             }
         }
 
-        if ( empty( $candidates ) ) return null;
-
-        // Sort by start time - pick the soonest
-        usort( $candidates, fn( $a, $b ) => $a['startTime'] <=> $b['startTime'] );
-        return $candidates[0];
+        usort( $matches, fn( $a, $b ) => $a['startTime'] <=> $b['startTime'] );
+        return $matches;
     }
 
     /**
-     * Auto-create a new webinar session when no future session exists.
-     * Copies subject/description from the most recent matching webinar.
+     * Find the soonest future session matching the pattern.
      */
-    private function auto_create_session( string $pattern, array $config ): ?array {
-        // Find the most recent matching webinar to clone settings from
-        $template = $this->find_template_webinar( $pattern );
+    private function find_by_pattern( string $pattern ): ?array {
+        $matches = $this->find_all_by_pattern( $pattern );
+        return $matches[0] ?? null;
+    }
+
+    /**
+     * Create the next session for a pattern.
+     * Copies subject/description from the most recent matching webinar.
+     * Calculates the next occurrence of the configured day/time.
+     */
+    public function create_next_session( string $pattern, array $config ): ?array {
+        $template = $this->find_template( $pattern );
         if ( ! $template ) {
-            GTW_Logger::log_api_error( 'auto_create', "No template webinar found matching '{$pattern}'" );
+            GTW_Logger::log_api_error( 'auto_create', "No template webinar found for pattern '{$pattern}'" );
             return null;
         }
 
-        // Calculate next session time
         $day      = $config['day'] ?? 'monday';
         $time     = $config['time'] ?? '15:00';
         $duration = (int) ( $config['duration'] ?? 30 );
         $tz       = $config['timezone'] ?? 'America/New_York';
 
-        $next_start = $this->calculate_next_date( $day, $time, $tz );
+        // Find the last scheduled session to avoid overlaps
+        $existing = $this->find_all_by_pattern( $pattern );
+        $last_start = 0;
+        foreach ( $existing as $s ) {
+            if ( $s['startTime'] > $last_start ) $last_start = $s['startTime'];
+        }
+
+        // Calculate next date AFTER the last existing session
+        $next_start = $this->calculate_next_date( $day, $time, $tz, $last_start );
         if ( ! $next_start ) return null;
 
         $next_end = $next_start + ( $duration * 60 );
 
-        // Create the webinar
         $result = $this->api->create_webinar( array(
             'subject'     => $template['subject'],
             'description' => $template['description'] ?? '',
@@ -144,17 +150,27 @@ class GTW_Session_Resolver {
                 'endTime'   => gmdate( 'Y-m-d\TH:i:s\Z', $next_end ),
             ) ),
             'timeZone'    => $tz,
+            'type'        => 'single_session',
         ) );
 
         if ( ! $result['success'] ) {
-            GTW_Logger::log_api_error( 'auto_create', 'Failed to create webinar: ' . ( $result['error'] ?? 'unknown' ) );
+            GTW_Logger::log_api_error( 'auto_create', 'Failed: ' . ( $result['error'] ?? 'unknown' ) );
             return null;
         }
 
         $new_key = $result['data']['webinarKey'] ?? '';
         if ( empty( $new_key ) ) return null;
 
-        GTW_Logger::log_api_error( 'auto_create', "Created new webinar {$new_key} for " . gmdate( 'Y-m-d H:i', $next_start ) . ' UTC' );
+        // Log success
+        $date_str = gmdate( 'Y-m-d H:i', $next_start );
+        GTW_Logger::log_entry( array(
+            'registrant_email' => 'system',
+            'registrant_name'  => 'Auto-Extend',
+            'session_id'       => $new_key,
+            'webinar_key'      => $new_key,
+            'status'           => 'success',
+            'error_message'    => "Auto-created session for {$date_str} UTC (pattern: {$pattern})",
+        ) );
 
         return array(
             'webinarKey'         => $new_key,
@@ -168,15 +184,14 @@ class GTW_Session_Resolver {
     }
 
     /**
-     * Find the most recent webinar matching pattern (for cloning settings).
+     * Find a template webinar to copy subject/description from.
      */
-    private function find_template_webinar( string $pattern ): ?array {
+    private function find_template( string $pattern ): ?array {
         $org_key = $this->api->get_organizer_key();
         if ( empty( $org_key ) ) return null;
 
-        // Look back 90 days for a template
         $from = gmdate( 'Y-m-d\TH:i:s\Z', time() - 90 * 86400 );
-        $to   = gmdate( 'Y-m-d\TH:i:s\Z', time() + 30 * 86400 );
+        $to   = gmdate( 'Y-m-d\TH:i:s\Z', time() + 180 * 86400 );
 
         $response = $this->api->api_get_public( "/organizers/{$org_key}/webinars?fromTime={$from}&toTime={$to}" );
         if ( ! $response['success'] ) return null;
@@ -185,29 +200,30 @@ class GTW_Session_Resolver {
         $pattern_lower = strtolower( $pattern );
 
         foreach ( $webinars as $w ) {
-            if ( strpos( strtolower( $w['subject'] ?? '' ), $pattern_lower ) !== false ) {
+            if ( is_array( $w ) && strpos( strtolower( $w['subject'] ?? '' ), $pattern_lower ) !== false ) {
                 return $w;
             }
         }
-
         return null;
     }
 
     /**
-     * Calculate the next occurrence of a given weekday and time.
+     * Calculate next occurrence of a weekday/time AFTER a given timestamp.
      */
-    private function calculate_next_date( string $day, string $time, string $timezone ): ?int {
+    private function calculate_next_date( string $day, string $time, string $timezone, int $after_ts = 0 ): ?int {
         try {
-            $tz = new DateTimeZone( $timezone );
+            $tz  = new DateTimeZone( $timezone );
             $now = new DateTime( 'now', $tz );
-            $target = new DateTime( "next {$day} {$time}", $tz );
+            $ref = $after_ts > 0 ? ( new DateTime() )->setTimestamp( $after_ts )->setTimezone( $tz ) : $now;
 
-            // If "next monday" is today and the time hasn't passed, use today
-            if ( strtolower( $now->format( 'l' ) ) === strtolower( $day ) ) {
-                $today_target = new DateTime( "today {$time}", $tz );
-                if ( $today_target > $now ) {
-                    $target = $today_target;
-                }
+            // Start from the reference date and find the next matching weekday
+            $target = clone $ref;
+            $target->modify( "next {$day}" );
+            $target->setTime( (int) explode( ':', $time )[0], (int) ( explode( ':', $time )[1] ?? 0 ) );
+
+            // Make sure it's in the future
+            if ( $target <= $now ) {
+                $target->modify( '+7 days' );
             }
 
             return $target->getTimestamp();
@@ -227,15 +243,14 @@ class GTW_Session_Resolver {
         $now = time();
         $upcoming = array();
 
-        foreach ( $sessions as $session ) {
-            $start = strtotime( $session['startTime'] ?? $session['startDate'] ?? '' );
-            $end   = strtotime( $session['endTime'] ?? $session['endDate'] ?? '' );
+        foreach ( $sessions as $s ) {
+            $start = strtotime( $s['startTime'] ?? $s['startDate'] ?? '' );
+            $end   = strtotime( $s['endTime'] ?? $s['endDate'] ?? '' );
             if ( $end && $end > $now ) {
                 $upcoming[] = array(
                     'webinarKey' => $webinar_key,
-                    'sessionKey' => $session['sessionKey'] ?? $webinar_key,
-                    'startTime'  => $start,
-                    'endTime'    => $end,
+                    'sessionKey' => $s['sessionKey'] ?? $webinar_key,
+                    'startTime'  => $start, 'endTime' => $end,
                     'startTimeFormatted' => gmdate( 'Y-m-d H:i:s', $start ),
                     'endTimeFormatted'   => gmdate( 'Y-m-d H:i:s', $end ),
                 );
@@ -245,69 +260,56 @@ class GTW_Session_Resolver {
         if ( empty( $upcoming ) ) return null;
         usort( $upcoming, fn( $a, $b ) => $a['startTime'] <=> $b['startTime'] );
 
-        $next = $upcoming[0];
-        $this->cache_session( $webinar_key, $next );
-        return $next;
+        $this->cache_session( $webinar_key, $upcoming[0] );
+        return $upcoming[0];
     }
 
-    /**
-     * Force refresh.
-     */
     public function refresh_session( string $webinar_key = '', string $name_pattern = '' ): ?array {
-        $cache_key = $name_pattern ?: $webinar_key;
-        $this->clear_cache( $cache_key );
+        $this->clear_cache( $name_pattern ?: $webinar_key );
         return $this->get_upcoming_session( $webinar_key, $name_pattern );
     }
 
-    // ---- Cache methods (same as before) ----
+    // ---- Cache ----
 
-    private function get_cached_session( string $cache_key ): ?array {
+    private function get_cached_session( string $key ): ?array {
         global $wpdb;
-        $table = $wpdb->prefix . 'gtw_webinar_series';
+        $t = $wpdb->prefix . 'gtw_webinar_series';
         $row = $wpdb->get_row( $wpdb->prepare(
-            "SELECT * FROM {$table} WHERE (webinar_key = %s OR label = %s) AND is_active = 1 LIMIT 1",
-            $cache_key, $cache_key
+            "SELECT * FROM {$t} WHERE (webinar_key = %s OR name_pattern = %s) AND is_active = 1 LIMIT 1",
+            $key, $key
         ), ARRAY_A );
 
         if ( ! $row || empty( $row['cached_session_id'] ) ) return null;
-
         $now = time();
-        $cache_expires = strtotime( $row['cache_expires_at'] ?? '2000-01-01' );
-        if ( $cache_expires < $now ) return null;
-
-        $session_end = strtotime( $row['cached_session_end'] ?? '2000-01-01' );
-        if ( $session_end < $now ) {
-            $this->clear_cache( $cache_key );
+        if ( strtotime( $row['cache_expires_at'] ?? '2000-01-01' ) < $now ) return null;
+        if ( strtotime( $row['cached_session_end'] ?? '2000-01-01' ) < $now ) {
+            $this->clear_cache( $key );
             return null;
         }
 
         return array(
-            'webinarKey' => $row['cached_session_id'],
-            'sessionKey' => $row['cached_session_id'],
-            'startTime'  => strtotime( $row['cached_session_start'] ),
-            'endTime'    => $session_end,
-            'startTimeFormatted' => $row['cached_session_start'],
-            'endTimeFormatted'   => $row['cached_session_end'],
+            'webinarKey' => $row['cached_session_id'], 'sessionKey' => $row['cached_session_id'],
+            'startTime' => strtotime( $row['cached_session_start'] ), 'endTime' => strtotime( $row['cached_session_end'] ),
+            'startTimeFormatted' => $row['cached_session_start'], 'endTimeFormatted' => $row['cached_session_end'],
         );
     }
 
-    private function cache_session( string $cache_key, array $session ): void {
+    private function cache_session( string $key, array $s ): void {
         global $wpdb;
-        $table = $wpdb->prefix . 'gtw_webinar_series';
+        $t = $wpdb->prefix . 'gtw_webinar_series';
         $ttl = (int) get_option( 'wp_gtw_cache_ttl', 15 );
-
-        $updated = $wpdb->update( $table, array(
-            'cached_session_id'    => $session['sessionKey'] ?? $session['webinarKey'],
-            'cached_session_start' => $session['startTimeFormatted'],
-            'cached_session_end'   => $session['endTimeFormatted'],
-            'cache_expires_at'     => gmdate( 'Y-m-d H:i:s', time() + $ttl * 60 ),
+        $wpdb->update( $t, array(
+            'cached_session_id' => $s['sessionKey'] ?? $s['webinarKey'],
+            'cached_session_start' => $s['startTimeFormatted'],
+            'cached_session_end' => $s['endTimeFormatted'],
+            'cache_expires_at' => gmdate( 'Y-m-d H:i:s', time() + $ttl * 60 ),
         ), array( 'is_active' => 1 ) );
     }
 
-    private function clear_cache( string $cache_key ): void {
+    private function clear_cache( string $key ): void {
         global $wpdb;
-        $table = $wpdb->prefix . 'gtw_webinar_series';
-        $wpdb->update( $table, array(
+        $t = $wpdb->prefix . 'gtw_webinar_series';
+        $wpdb->update( $t, array(
             'cached_session_id' => null, 'cached_session_start' => null,
             'cached_session_end' => null, 'cache_expires_at' => null,
         ), array( 'is_active' => 1 ) );

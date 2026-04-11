@@ -158,7 +158,28 @@ add_action( 'rest_api_init', function() {
             }
             $debug['webinars_detail'] = $all_webinars;
 
-            // Test CREATE capability
+            // Test: can we add a date to an existing series?
+            // Find a 30-in-30 webinar to get its recurrence key
+            $series_recurrence_key = null;
+            $series_subject = null;
+            $series_description = null;
+            foreach ( $embedded as $w ) {
+                if ( is_array( $w ) && stripos( $w['subject'] ?? '', '30 in 30' ) !== false ) {
+                    $series_recurrence_key = $w['recurrenceKey'] ?? null;
+                    $series_subject = $w['subject'];
+                    $series_description = $w['description'] ?? '';
+                    break;
+                }
+            }
+            $debug['series_info'] = array(
+                'recurrenceKey' => $series_recurrence_key,
+                'subject' => $series_subject,
+            );
+
+            // Test CREATE - try to create a new webinar with same subject (NOT linked to series - just standalone with same name)
+            // This tests if pattern matching would pick it up
+            $test_start = gmdate( 'Y-m-d\TH:i:s\Z', time() + 60 * 86400 ); // 60 days from now
+            $test_end = gmdate( 'Y-m-d\TH:i:s\Z', time() + 60 * 86400 + 1800 );
             $create_test = wp_remote_post( "https://api.getgo.com/G2W/rest/v2/organizers/{$org}/webinars", array(
                 'timeout' => 8,
                 'headers' => array(
@@ -167,13 +188,14 @@ add_action( 'rest_api_init', function() {
                     'Accept'        => 'application/json',
                 ),
                 'body' => wp_json_encode( array(
-                    'subject'     => 'API_CREATE_TEST_DELETE_ME',
-                    'description' => 'Testing if API can create webinars - delete this',
+                    'subject'     => $series_subject ?: 'API_CREATE_TEST_DELETE_ME',
+                    'description' => $series_description ?: 'Test webinar',
                     'times'       => array( array(
-                        'startTime' => gmdate( 'Y-m-d\TH:i:s\Z', time() + 30 * 86400 ),
-                        'endTime'   => gmdate( 'Y-m-d\TH:i:s\Z', time() + 30 * 86400 + 1800 ),
+                        'startTime' => $test_start,
+                        'endTime'   => $test_end,
                     ) ),
                     'timeZone'    => 'America/New_York',
+                    'type'        => 'single_session',
                 ) ),
             ) );
             $create_code = wp_remote_retrieve_response_code( $create_test );
@@ -301,9 +323,71 @@ function wp_gtw_process_retry() {
 add_action( 'wp_gtw_retry_failed', 'wp_gtw_process_retry' );
 
 /**
+ * Daily cron: auto-extend webinar series when sessions are running low.
+ * Creates new sessions to maintain a buffer of upcoming dates.
+ */
+function wp_gtw_auto_extend() {
+    global $wpdb;
+    $table = $wpdb->prefix . 'gtw_webinar_series';
+
+    $series_list = $wpdb->get_results(
+        "SELECT * FROM {$table} WHERE is_active = 1 AND auto_create_enabled = 1 AND name_pattern != ''",
+        ARRAY_A
+    );
+
+    if ( empty( $series_list ) ) return;
+
+    $api      = new GTW_API();
+    $resolver = new GTW_Session_Resolver( $api );
+
+    foreach ( $series_list as $series ) {
+        $pattern   = $series['name_pattern'];
+        $threshold = 2; // Create new session when fewer than this many remain
+
+        $count = $resolver->count_upcoming_sessions( $pattern );
+
+        if ( $count < $threshold ) {
+            $config = array(
+                'enabled'  => true,
+                'day'      => $series['auto_create_day'] ?? 'monday',
+                'time'     => $series['auto_create_time'] ?? '15:00',
+                'duration' => (int) ( $series['auto_create_duration'] ?? 30 ),
+                'timezone' => $series['auto_create_timezone'] ?? 'America/New_York',
+            );
+
+            $new_session = $resolver->create_next_session( $pattern, $config );
+
+            if ( $new_session ) {
+                $date = $new_session['startTimeFormatted'];
+                error_log( "[WP-GTW] Auto-extended '{$pattern}': created session {$new_session['webinarKey']} for {$date} (was {$count} remaining)" );
+            } else {
+                // Alert admin
+                GTW_Logger::send_alert(
+                    'Auto-Extend System',
+                    'system@' . wp_parse_url( home_url(), PHP_URL_HOST ),
+                    "Failed to auto-create new session for pattern '{$pattern}'. Only {$count} session(s) remaining. Please create one manually in GoToWebinar."
+                );
+            }
+        }
+    }
+}
+add_action( 'wp_gtw_daily_extend', 'wp_gtw_auto_extend' );
+
+/**
+ * Schedule the daily auto-extend cron.
+ */
+function wp_gtw_schedule_daily() {
+    if ( ! wp_next_scheduled( 'wp_gtw_daily_extend' ) ) {
+        wp_schedule_event( time(), 'daily', 'wp_gtw_daily_extend' );
+    }
+}
+add_action( 'wp', 'wp_gtw_schedule_daily' );
+
+/**
  * Deactivation: clear scheduled events.
  */
 function wp_gtw_deactivate() {
     wp_clear_scheduled_hook( 'wp_gtw_retry_failed' );
+    wp_clear_scheduled_hook( 'wp_gtw_daily_extend' );
 }
 register_deactivation_hook( __FILE__, 'wp_gtw_deactivate' );

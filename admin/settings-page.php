@@ -155,6 +155,82 @@ add_action( 'wp_ajax_wp_gtw_get_form_fields', function() {
     wp_send_json( $result );
 } );
 
+// Handle AJAX: count upcoming sessions for a pattern
+add_action( 'wp_ajax_wp_gtw_count_sessions', function() {
+    check_ajax_referer( 'wp_gtw_nonce', 'nonce' );
+    if ( ! current_user_can( 'manage_options' ) ) wp_die( 'Unauthorized' );
+
+    $pattern = sanitize_text_field( $_POST['pattern'] ?? '' );
+    if ( empty( $pattern ) ) {
+        wp_send_json( array( 'success' => false, 'error' => 'No pattern provided' ) );
+    }
+
+    $api      = new GTW_API();
+    $resolver = new GTW_Session_Resolver( $api );
+    $sessions = $resolver->find_all_by_pattern( $pattern );
+
+    $result = array(
+        'success'  => true,
+        'count'    => count( $sessions ),
+        'sessions' => array(),
+    );
+
+    foreach ( $sessions as $s ) {
+        $result['sessions'][] = array(
+            'webinarKey' => $s['webinarKey'],
+            'startTime'  => $s['startTimeFormatted'],
+            'endTime'    => $s['endTimeFormatted'],
+        );
+    }
+
+    wp_send_json( $result );
+} );
+
+// Handle AJAX: manually trigger auto-extend now
+add_action( 'wp_ajax_wp_gtw_extend_now', function() {
+    check_ajax_referer( 'wp_gtw_nonce', 'nonce' );
+    if ( ! current_user_can( 'manage_options' ) ) wp_die( 'Unauthorized' );
+
+    $pattern = sanitize_text_field( $_POST['pattern'] ?? '' );
+    if ( empty( $pattern ) ) {
+        wp_send_json( array( 'success' => false, 'error' => 'No pattern provided' ) );
+    }
+
+    global $wpdb;
+    $table  = $wpdb->prefix . 'gtw_webinar_series';
+    $series = $wpdb->get_row( $wpdb->prepare(
+        "SELECT * FROM {$table} WHERE name_pattern = %s AND is_active = 1 LIMIT 1",
+        $pattern
+    ), ARRAY_A );
+
+    if ( ! $series ) {
+        wp_send_json( array( 'success' => false, 'error' => 'Save the webinar configuration first' ) );
+    }
+
+    $api      = new GTW_API();
+    $resolver = new GTW_Session_Resolver( $api );
+    $config   = array(
+        'enabled'  => true,
+        'day'      => $series['auto_create_day'] ?? 'monday',
+        'time'     => $series['auto_create_time'] ?? '15:00',
+        'duration' => (int) ( $series['auto_create_duration'] ?? 30 ),
+        'timezone' => $series['auto_create_timezone'] ?? 'America/New_York',
+    );
+
+    $new_session = $resolver->create_next_session( $pattern, $config );
+    if ( $new_session ) {
+        wp_send_json( array(
+            'success' => true,
+            'session' => array(
+                'webinarKey' => $new_session['webinarKey'],
+                'startTime'  => $new_session['startTimeFormatted'],
+            ),
+        ) );
+    } else {
+        wp_send_json( array( 'success' => false, 'error' => 'Failed to create new session' ) );
+    }
+} );
+
 // Handle AJAX: list webinars from GTW account
 add_action( 'wp_ajax_wp_gtw_list_webinars', function() {
     check_ajax_referer( 'wp_gtw_nonce', 'nonce' );
@@ -285,8 +361,8 @@ function wp_gtw_settings_page() {
             </table>
             <button class="button" id="gtw-refresh-btn">Refresh Sessions</button>
 
-            <h3 style="margin-top:20px;">Auto-Create Sessions</h3>
-            <p class="description">When no upcoming session matches the name pattern, the plugin can automatically create a new webinar session.</p>
+            <h3 style="margin-top:20px;">Auto-Extend Series</h3>
+            <p class="description">A daily cron checks how many future sessions match the name pattern. When fewer than 2 remain, a new session is created with the same name and description. GoToWebinar sends its own confirmation and reminder emails to each registrant.</p>
             <table class="form-table">
                 <tr>
                     <th>Enable Auto-Create</th>
@@ -335,6 +411,13 @@ function wp_gtw_settings_page() {
                 </div>
             <?php endif; ?>
             <div id="gtw-session-result" style="margin-top:10px;"></div>
+            <div style="margin-top:15px; padding-top:15px; border-top:1px solid #eee; display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+                <button class="button button-primary" id="gtw-save-webinar">Save Webinar Settings</button>
+                <button class="button" id="gtw-check-sessions">Check Upcoming Sessions</button>
+                <button class="button" id="gtw-extend-now" style="color:#0073aa;">Create Next Session Now</button>
+                <span id="gtw-save-webinar-status" style="margin-left:10px;"></span>
+            </div>
+            <div id="gtw-session-count" style="margin-top:10px;"></div>
         </div>
 
         <!-- Form Mapping -->
@@ -364,6 +447,10 @@ function wp_gtw_settings_page() {
                 <tr><th>Organization Field ID</th><td><input type="text" id="gtw-map-org" value="<?php echo esc_attr( $mapping['organization'] ?? '' ); ?>" class="small-text" /></td></tr>
             </table>
             <p class="description">Enter the WPForms field IDs for each GoToWebinar field. Find field IDs in WPForms form editor (each field shows its ID).</p>
+            <div style="margin-top:15px; padding-top:15px; border-top:1px solid #eee;">
+                <button class="button button-primary" id="gtw-save-mapping">Save Field Mapping</button>
+                <span id="gtw-save-mapping-status" style="margin-left:10px;"></span>
+            </div>
         </div>
 
         <!-- Notification Settings -->
@@ -391,7 +478,6 @@ function wp_gtw_settings_page() {
             </form>
         </div>
 
-        <button class="button button-primary button-hero" id="gtw-save-series">Save Webinar Configuration</button>
         <input type="hidden" id="gtw-series-id" value="<?php echo esc_attr( $series['id'] ?? '' ); ?>" />
         <input type="hidden" id="gtw-nonce" value="<?php echo esc_attr( $nonce ); ?>" />
 
@@ -505,9 +591,52 @@ function wp_gtw_settings_page() {
                 });
             });
 
-            // Save series
-            $('#gtw-save-series').on('click', function() {
-                var $btn = $(this).prop('disabled', true).text('Saving...');
+            // Check upcoming sessions
+            $('#gtw-check-sessions').on('click', function() {
+                var pattern = $('#gtw-name-pattern').val();
+                if (!pattern) { alert('Enter a name pattern first'); return; }
+                var $btn = $(this).prop('disabled', true).text('Checking...');
+                $.post(ajaxurl, { action: 'wp_gtw_count_sessions', nonce: nonce, pattern: pattern }, function(r) {
+                    $btn.prop('disabled', false).text('Check Upcoming Sessions');
+                    if (!r.success) {
+                        $('#gtw-session-count').html('<span class="gtw-status gtw-status-error">' + (r.error || 'Error') + '</span>');
+                        return;
+                    }
+                    var color = r.count >= 3 ? 'gtw-status-ok' : r.count >= 1 ? 'gtw-status-pending' : 'gtw-status-error';
+                    var html = '<span class="gtw-status ' + color + '">' + r.count + ' upcoming session(s) matching "' + pattern + '"</span>';
+                    if (r.sessions && r.sessions.length) {
+                        html += '<ul style="font-size:12px;margin:8px 0 0 16px;color:#555;">';
+                        r.sessions.forEach(function(s) {
+                            html += '<li>' + s.startTime + ' UTC (key: ' + s.webinarKey.substring(0, 12) + '...)</li>';
+                        });
+                        html += '</ul>';
+                    }
+                    if (r.count < 2) {
+                        html += '<p style="font-size:12px;color:#dc3545;margin-top:6px;">Low session count! The daily cron will auto-create new sessions if auto-extend is enabled.</p>';
+                    }
+                    $('#gtw-session-count').html(html);
+                });
+            });
+
+            // Extend now - manually create next session
+            $('#gtw-extend-now').on('click', function() {
+                var pattern = $('#gtw-name-pattern').val();
+                if (!pattern) { alert('Enter a name pattern first'); return; }
+                if (!confirm('Create a new "' + pattern + '" webinar session for the next available date?')) return;
+                var $btn = $(this).prop('disabled', true).text('Creating...');
+                $.post(ajaxurl, { action: 'wp_gtw_extend_now', nonce: nonce, pattern: pattern }, function(r) {
+                    $btn.prop('disabled', false).text('Create Next Session Now');
+                    if (r.success) {
+                        $('#gtw-session-count').html('<span class="gtw-status gtw-status-ok">Created! New session: ' + r.session.startTime + ' (key: ' + r.session.webinarKey.substring(0, 12) + '...)</span>');
+                    } else {
+                        $('#gtw-session-count').html('<span class="gtw-status gtw-status-error">Failed: ' + (r.error || 'Unknown error') + '</span>');
+                    }
+                });
+            });
+
+            // Save helper - both buttons use this
+            function saveAllSeries($btn, $status) {
+                $btn.prop('disabled', true).text('Saving...');
                 $.post(ajaxurl, {
                     action: 'wp_gtw_save_series',
                     nonce: nonce,
@@ -529,12 +658,23 @@ function wp_gtw_settings_page() {
                 }, function(r) {
                     if (r.success) {
                         $('#gtw-series-id').val(r.id);
-                        alert('Saved successfully!');
+                        $status.html('<span class="gtw-status gtw-status-ok">Saved!</span>');
+                        setTimeout(function() { $status.html(''); }, 3000);
                     } else {
-                        alert('Save failed: ' + (r.error || 'Unknown error'));
+                        $status.html('<span class="gtw-status gtw-status-error">Failed: ' + (r.error || 'Unknown') + '</span>');
                     }
-                    $btn.prop('disabled', false).text('Save Webinar Configuration');
+                    $btn.prop('disabled', false).text($btn.data('label'));
                 });
+            }
+
+            // Save Webinar Settings button
+            $('#gtw-save-webinar').data('label', 'Save Webinar Settings').on('click', function() {
+                saveAllSeries($(this), $('#gtw-save-webinar-status'));
+            });
+
+            // Save Field Mapping button
+            $('#gtw-save-mapping').data('label', 'Save Field Mapping').on('click', function() {
+                saveAllSeries($(this), $('#gtw-save-mapping-status'));
             });
         });
         </script>
