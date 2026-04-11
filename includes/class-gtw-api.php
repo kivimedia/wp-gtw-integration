@@ -186,13 +186,13 @@ class GTW_API {
     }
 
     /**
-     * Disconnect - clear all tokens.
+     * Disconnect - clear tokens only. NEVER clears client ID, secret, or organizer key.
      */
     public function disconnect(): void {
         delete_option( self::TOKEN_KEY );
         delete_option( self::REFRESH_KEY );
         delete_option( self::EXPIRY_KEY );
-        delete_option( self::ORG_KEY );
+        // Deliberately NOT deleting: wp_gtw_client_id, wp_gtw_client_secret, wp_gtw_organizer_key
     }
 
     /**

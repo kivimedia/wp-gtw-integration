@@ -114,20 +114,34 @@ class GTW_Session_Resolver {
 
     /**
      * Create the next session for a pattern.
-     * Copies subject/description from the most recent matching webinar.
-     * Calculates the next occurrence of the configured day/time.
+     * Reads day, time, duration, timezone from the ACTUAL webinar template - not admin config.
+     * The new session is an exact continuation of the existing series schedule.
      */
-    public function create_next_session( string $pattern, array $config ): ?array {
+    public function create_next_session( string $pattern, array $config = array() ): ?array {
         $template = $this->find_template( $pattern );
         if ( ! $template ) {
             GTW_Logger::log_api_error( 'auto_create', "No template webinar found for pattern '{$pattern}'" );
             return null;
         }
 
-        $day      = $config['day'] ?? 'monday';
-        $time     = $config['time'] ?? '15:00';
-        $duration = (int) ( $config['duration'] ?? 30 );
-        $tz       = $config['timezone'] ?? 'America/New_York';
+        // Read schedule from the ACTUAL webinar, not from admin config
+        $template_times = $template['times'] ?? array();
+        $template_tz    = $template['timeZone'] ?? ( $config['timezone'] ?? 'America/New_York' );
+
+        if ( empty( $template_times ) ) {
+            GTW_Logger::log_api_error( 'auto_create', 'Template webinar has no scheduled times' );
+            return null;
+        }
+
+        // Extract day of week, time, and duration from the template webinar
+        $tpl_start_ts = strtotime( $template_times[0]['startTime'] );
+        $tpl_end_ts   = strtotime( $template_times[0]['endTime'] );
+        $duration     = $tpl_end_ts && $tpl_start_ts ? max( 15, (int) ( ( $tpl_end_ts - $tpl_start_ts ) / 60 ) ) : 30;
+
+        $tz_obj  = new \DateTimeZone( $template_tz );
+        $tpl_dt  = ( new \DateTime() )->setTimestamp( $tpl_start_ts )->setTimezone( $tz_obj );
+        $day     = strtolower( $tpl_dt->format( 'l' ) ); // e.g. "monday"
+        $time    = $tpl_dt->format( 'H:i' );              // e.g. "15:00"
 
         // Find the last scheduled session to avoid overlaps
         $existing = $this->find_all_by_pattern( $pattern );
@@ -136,8 +150,8 @@ class GTW_Session_Resolver {
             if ( $s['startTime'] > $last_start ) $last_start = $s['startTime'];
         }
 
-        // Calculate next date AFTER the last existing session
-        $next_start = $this->calculate_next_date( $day, $time, $tz, $last_start );
+        // Calculate next date AFTER the last existing session (same day/time, next week)
+        $next_start = $this->calculate_next_date( $day, $time, $template_tz, $last_start );
         if ( ! $next_start ) return null;
 
         $next_end = $next_start + ( $duration * 60 );
@@ -149,7 +163,7 @@ class GTW_Session_Resolver {
                 'startTime' => gmdate( 'Y-m-d\TH:i:s\Z', $next_start ),
                 'endTime'   => gmdate( 'Y-m-d\TH:i:s\Z', $next_end ),
             ) ),
-            'timeZone'    => $tz,
+            'timeZone'    => $template_tz,
             'type'        => 'single_session',
         ) );
 

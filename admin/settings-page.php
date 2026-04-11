@@ -70,31 +70,41 @@ add_action( 'wp_ajax_wp_gtw_save_series', function() {
     global $wpdb;
     $table = $wpdb->prefix . 'gtw_webinar_series';
 
-    $data = array(
-        'label'                => sanitize_text_field( $_POST['label'] ?? 'Default Webinar' ),
-        'webinar_key'          => sanitize_text_field( $_POST['webinar_key'] ?? '' ),
-        'name_pattern'         => sanitize_text_field( $_POST['name_pattern'] ?? '' ),
-        'wpforms_form_id'      => absint( $_POST['wpforms_form_id'] ?? 0 ),
-        'field_mapping'        => wp_json_encode( array(
+    $section = sanitize_text_field( $_POST['section'] ?? 'all' );
+    $series_id = absint( $_POST['series_id'] ?? 0 );
+
+    // Build data based on which section is being saved
+    $data = array( 'is_active' => 1 );
+
+    if ( $section === 'webinar' || $section === 'all' ) {
+        $data['label']                = sanitize_text_field( $_POST['label'] ?? 'Default Webinar' );
+        $data['webinar_key']          = sanitize_text_field( $_POST['webinar_key'] ?? '' );
+        $data['name_pattern']         = sanitize_text_field( $_POST['name_pattern'] ?? '' );
+        $data['auto_create_enabled']  = ! empty( $_POST['auto_create_enabled'] ) ? 1 : 0;
+        $data['auto_create_day']      = sanitize_text_field( $_POST['auto_create_day'] ?? 'monday' );
+        $data['auto_create_time']     = sanitize_text_field( $_POST['auto_create_time'] ?? '15:00' );
+        $data['auto_create_duration'] = absint( $_POST['auto_create_duration'] ?? 30 );
+        $data['auto_create_timezone'] = sanitize_text_field( $_POST['auto_create_timezone'] ?? 'America/New_York' );
+    }
+
+    if ( $section === 'mapping' || $section === 'all' ) {
+        $data['wpforms_form_id'] = absint( $_POST['wpforms_form_id'] ?? 0 );
+        $data['field_mapping']   = wp_json_encode( array(
             'firstName'    => sanitize_text_field( $_POST['map_first_name'] ?? '' ),
             'lastName'     => sanitize_text_field( $_POST['map_last_name'] ?? '' ),
             'email'        => sanitize_text_field( $_POST['map_email'] ?? '' ),
             'phone'        => sanitize_text_field( $_POST['map_phone'] ?? '' ),
             'organization' => sanitize_text_field( $_POST['map_organization'] ?? '' ),
-        ) ),
-        'is_active'            => 1,
-        'auto_create_enabled'  => ! empty( $_POST['auto_create_enabled'] ) ? 1 : 0,
-        'auto_create_day'      => sanitize_text_field( $_POST['auto_create_day'] ?? 'monday' ),
-        'auto_create_time'     => sanitize_text_field( $_POST['auto_create_time'] ?? '15:00' ),
-        'auto_create_duration' => absint( $_POST['auto_create_duration'] ?? 30 ),
-        'auto_create_timezone' => sanitize_text_field( $_POST['auto_create_timezone'] ?? 'America/New_York' ),
-    );
-
-    $series_id = absint( $_POST['series_id'] ?? 0 );
+        ) );
+    }
 
     if ( $series_id ) {
         $wpdb->update( $table, $data, array( 'id' => $series_id ) );
     } else {
+        // First save - need both sections
+        if ( ! isset( $data['label'] ) ) $data['label'] = 'Default Webinar';
+        if ( ! isset( $data['wpforms_form_id'] ) ) $data['wpforms_form_id'] = 0;
+        if ( ! isset( $data['field_mapping'] ) ) $data['field_mapping'] = '{}';
         $wpdb->insert( $table, $data );
         $series_id = $wpdb->insert_id;
     }
@@ -359,55 +369,24 @@ function wp_gtw_settings_page() {
                     </td>
                 </tr>
             </table>
-            <button class="button" id="gtw-refresh-btn">Refresh Sessions</button>
+            <!-- Refresh Sessions removed - use "Check Upcoming Sessions" button below instead -->
 
             <h3 style="margin-top:20px;">Auto-Extend Series</h3>
-            <p class="description">A daily cron checks how many future sessions match the name pattern. When fewer than 2 remain, a new session is created with the same name and description. GoToWebinar sends its own confirmation and reminder emails to each registrant.</p>
+            <p class="description">A daily cron checks how many future sessions match the name pattern. When fewer than 2 remain, a new session is automatically created with the <strong>same day, time, duration, and timezone</strong> as the existing webinar. No manual schedule config needed.</p>
             <table class="form-table">
                 <tr>
-                    <th>Enable Auto-Create</th>
-                    <td><label><input type="checkbox" id="gtw-auto-create" <?php checked( $series['auto_create_enabled'] ?? 0 ); ?> /> Automatically create a new webinar when none is available</label></td>
-                </tr>
-                <tr>
-                    <th>Day of Week</th>
-                    <td>
-                        <select id="gtw-auto-day">
-                            <?php foreach ( array( 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday' ) as $d ) : ?>
-                                <option value="<?php echo $d; ?>" <?php selected( $series['auto_create_day'] ?? 'monday', $d ); ?>><?php echo ucfirst( $d ); ?></option>
-                            <?php endforeach; ?>
-                        </select>
-                    </td>
-                </tr>
-                <tr>
-                    <th>Time (local)</th>
-                    <td><input type="time" id="gtw-auto-time" value="<?php echo esc_attr( $series['auto_create_time'] ?? '15:00' ); ?>" /></td>
-                </tr>
-                <tr>
-                    <th>Duration (minutes)</th>
-                    <td><input type="number" id="gtw-auto-duration" value="<?php echo esc_attr( $series['auto_create_duration'] ?? 30 ); ?>" min="15" max="240" class="small-text" /></td>
-                </tr>
-                <tr>
-                    <th>Timezone</th>
-                    <td>
-                        <select id="gtw-auto-tz">
-                            <?php foreach ( array( 'America/New_York', 'America/Chicago', 'America/Denver', 'America/Los_Angeles', 'UTC' ) as $tz ) : ?>
-                                <option value="<?php echo $tz; ?>" <?php selected( $series['auto_create_timezone'] ?? 'America/New_York', $tz ); ?>><?php echo $tz; ?></option>
-                            <?php endforeach; ?>
-                        </select>
-                    </td>
+                    <th>Enable Auto-Extend</th>
+                    <td><label><input type="checkbox" id="gtw-auto-create" <?php checked( $series['auto_create_enabled'] ?? 0 ); ?> /> Automatically create new sessions when fewer than 2 remain</label></td>
                 </tr>
             </table>
+            <p class="description" style="margin-top:8px; color:#555;">Schedule is read from the existing webinar: same weekday, same time, same duration. The plugin looks at the most recent session and schedules the next one on the following week.</p>
 
             <?php if ( ! empty( $series['cached_session_id'] ) ) : ?>
                 <div class="gtw-session-box">
-                    <strong>Active Session:</strong><br />
+                    <strong>Next registration goes to:</strong><br />
                     Session ID: <?php echo esc_html( $series['cached_session_id'] ); ?><br />
                     Start: <?php echo esc_html( $series['cached_session_start'] ); ?> UTC<br />
                     End: <?php echo esc_html( $series['cached_session_end'] ); ?> UTC
-                </div>
-            <?php else : ?>
-                <div class="gtw-session-box">
-                    <span class="gtw-status gtw-status-pending">No session cached - will resolve on next registration</span>
                 </div>
             <?php endif; ?>
             <div id="gtw-session-result" style="margin-top:10px;"></div>
@@ -579,17 +558,7 @@ function wp_gtw_settings_page() {
                 });
             });
 
-            // Refresh sessions
-            $('#gtw-refresh-btn').on('click', function() {
-                var $btn = $(this).prop('disabled', true).text('Refreshing...');
-                $.post(ajaxurl, { action: 'wp_gtw_refresh_sessions', nonce: nonce, webinar_key: $('#gtw-webinar-key').val() }, function(r) {
-                    var html = r.success
-                        ? '<span class="gtw-status gtw-status-ok">Next session: ' + r.session.startTime + ' UTC (ID: ' + r.session.sessionKey + ')</span>'
-                        : '<span class="gtw-status gtw-status-error">' + (r.error || 'No sessions found') + '</span>';
-                    $('#gtw-session-result').html(html);
-                    $btn.prop('disabled', false).text('Refresh Sessions');
-                });
-            });
+            // (Refresh Sessions removed - use Check Upcoming Sessions instead)
 
             // Check upcoming sessions
             $('#gtw-check-sessions').on('click', function() {
@@ -634,28 +603,16 @@ function wp_gtw_settings_page() {
                 });
             });
 
-            // Save helper - both buttons use this
-            function saveAllSeries($btn, $status) {
+            // Save helper
+            function saveSeries(section, fields, $btn, $status) {
                 $btn.prop('disabled', true).text('Saving...');
-                $.post(ajaxurl, {
+                var data = $.extend({
                     action: 'wp_gtw_save_series',
                     nonce: nonce,
                     series_id: $('#gtw-series-id').val(),
-                    label: $('#gtw-label').val(),
-                    webinar_key: $('#gtw-webinar-key').val(),
-                    name_pattern: $('#gtw-name-pattern').val(),
-                    wpforms_form_id: $('#gtw-form-id').val(),
-                    map_first_name: $('#gtw-map-first').val(),
-                    map_last_name: $('#gtw-map-last').val(),
-                    map_email: $('#gtw-map-email').val(),
-                    map_phone: $('#gtw-map-phone').val(),
-                    map_organization: $('#gtw-map-org').val(),
-                    auto_create_enabled: $('#gtw-auto-create').is(':checked') ? 1 : 0,
-                    auto_create_day: $('#gtw-auto-day').val(),
-                    auto_create_time: $('#gtw-auto-time').val(),
-                    auto_create_duration: $('#gtw-auto-duration').val(),
-                    auto_create_timezone: $('#gtw-auto-tz').val(),
-                }, function(r) {
+                    section: section,
+                }, fields);
+                $.post(ajaxurl, data, function(r) {
                     if (r.success) {
                         $('#gtw-series-id').val(r.id);
                         $status.html('<span class="gtw-status gtw-status-ok">Saved!</span>');
@@ -667,14 +624,26 @@ function wp_gtw_settings_page() {
                 });
             }
 
-            // Save Webinar Settings button
+            // Save Webinar Settings
             $('#gtw-save-webinar').data('label', 'Save Webinar Settings').on('click', function() {
-                saveAllSeries($(this), $('#gtw-save-webinar-status'));
+                saveSeries('webinar', {
+                    label: $('#gtw-label').val(),
+                    webinar_key: $('#gtw-webinar-key').val(),
+                    name_pattern: $('#gtw-name-pattern').val(),
+                    auto_create_enabled: $('#gtw-auto-create').is(':checked') ? 1 : 0,
+                }, $(this), $('#gtw-save-webinar-status'));
             });
 
-            // Save Field Mapping button
+            // Save Field Mapping - only form + field mapping
             $('#gtw-save-mapping').data('label', 'Save Field Mapping').on('click', function() {
-                saveAllSeries($(this), $('#gtw-save-mapping-status'));
+                saveSeries('mapping', {
+                    wpforms_form_id: $('#gtw-form-id').val(),
+                    map_first_name: $('#gtw-map-first').val(),
+                    map_last_name: $('#gtw-map-last').val(),
+                    map_email: $('#gtw-map-email').val(),
+                    map_phone: $('#gtw-map-phone').val(),
+                    map_organization: $('#gtw-map-org').val(),
+                }, $(this), $('#gtw-save-mapping-status'));
             });
         });
         </script>
