@@ -16,12 +16,12 @@ add_action( 'admin_menu', function() {
     );
 } );
 
-// Register settings
+// Register settings - separate groups so saving one form doesn't wipe the other
 add_action( 'admin_init', function() {
-    register_setting( 'wp_gtw_settings', 'wp_gtw_client_id' );
-    register_setting( 'wp_gtw_settings', 'wp_gtw_client_secret' );
-    register_setting( 'wp_gtw_settings', 'wp_gtw_cache_ttl', array( 'type' => 'integer', 'default' => 15 ) );
-    register_setting( 'wp_gtw_settings', 'wp_gtw_alert_email' );
+    register_setting( 'wp_gtw_credentials', 'wp_gtw_client_id' );
+    register_setting( 'wp_gtw_credentials', 'wp_gtw_client_secret' );
+    register_setting( 'wp_gtw_notifications', 'wp_gtw_cache_ttl', array( 'type' => 'integer', 'default' => 15 ) );
+    register_setting( 'wp_gtw_notifications', 'wp_gtw_alert_email' );
 } );
 
 // Handle AJAX: test connection
@@ -331,14 +331,18 @@ function wp_gtw_settings_page() {
             <h2>GoToWebinar Connection</h2>
 
             <?php if ( $is_connected ) : ?>
-                <p><span class="gtw-status gtw-status-ok">Connected</span></p>
+                <p><span class="gtw-status gtw-status-pending" id="gtw-status-badge">Checking connection...</span></p>
                 <button class="button" id="gtw-test-btn">Test Connection</button>
                 <button class="button" id="gtw-disconnect-btn" style="color:#dc3545;">Disconnect</button>
                 <div id="gtw-connection-result" style="margin-top:10px;"></div>
+                <div id="gtw-reconnect-area" style="display:none;margin-top:15px;">
+                    <p style="color:#856404;">Your GoToWebinar session has expired. Click below to reconnect.</p>
+                    <a href="<?php echo esc_url( $api->get_auth_url() ); ?>" class="button button-primary">Reconnect to GoToWebinar</a>
+                </div>
             <?php else : ?>
                 <p>Enter your GoToWebinar OAuth credentials, save, then click Connect.</p>
                 <form method="post" action="options.php">
-                    <?php settings_fields( 'wp_gtw_settings' ); ?>
+                    <?php settings_fields( 'wp_gtw_credentials' ); ?>
                     <table class="form-table">
                         <tr>
                             <th>Client ID</th>
@@ -451,7 +455,7 @@ function wp_gtw_settings_page() {
         <div class="gtw-card">
             <h2>Notification Settings</h2>
             <form method="post" action="options.php">
-                <?php settings_fields( 'wp_gtw_settings' ); ?>
+                <?php settings_fields( 'wp_gtw_notifications' ); ?>
                 <table class="form-table">
                     <tr>
                         <th>Alert Email</th>
@@ -479,17 +483,30 @@ function wp_gtw_settings_page() {
         jQuery(function($) {
             var nonce = $('#gtw-nonce').val();
 
-            // Test connection
-            $('#gtw-test-btn').on('click', function() {
-                var $btn = $(this).prop('disabled', true).text('Testing...');
+            // Test connection handler
+            function testConnection(isAutoTest) {
+                var $btn = $('#gtw-test-btn').prop('disabled', true).text('Testing...');
                 $.post(ajaxurl, { action: 'wp_gtw_test_connection', nonce: nonce }, function(r) {
-                    var html = r.success
-                        ? '<span class="gtw-status gtw-status-ok">Connected - ' + (r.data.email || '') + '</span>'
-                        : '<span class="gtw-status gtw-status-error">Error: ' + (r.error || 'Unknown') + '</span>';
-                    $('#gtw-connection-result').html(html);
+                    if (r.success) {
+                        $('#gtw-status-badge').removeClass('gtw-status-pending gtw-status-error').addClass('gtw-status-ok').text('Connected');
+                        $('#gtw-connection-result').html('<span class="gtw-status gtw-status-ok">Connected - ' + (r.data.email || '') + '</span>');
+                        $('#gtw-reconnect-area').hide();
+                    } else {
+                        $('#gtw-status-badge').removeClass('gtw-status-pending gtw-status-ok').addClass('gtw-status-error').text('Disconnected');
+                        $('#gtw-connection-result').html('<span class="gtw-status gtw-status-error">' + (r.error || 'Unknown error') + '</span>');
+                        if (r.reconnect) {
+                            $('#gtw-reconnect-area').show();
+                            $('#gtw-test-btn, #gtw-disconnect-btn').hide();
+                        }
+                    }
                     $btn.prop('disabled', false).text('Test Connection');
                 });
-            });
+            }
+
+            $('#gtw-test-btn').on('click', function() { testConnection(false); });
+
+            // Auto-test on page load when connected
+            testConnection(true);
 
             // Auto-detect form field mapping on form selection change
             $('#gtw-form-id').on('change', function() {
