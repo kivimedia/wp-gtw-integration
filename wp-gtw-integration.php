@@ -3,7 +3,7 @@
  * Plugin Name: WP-GTW Integration
  * Plugin URI:  https://github.com/kivimedia/wp-gtw-integration
  * Description: WordPress to GoToWebinar integration - auto-detects upcoming sessions, registers via WPForms, replaces Zapier.
- * Version:     1.3.0
+ * Version:     2.0.0
  * Author:      Kivi Media
  * Author URI:  https://kivimedia.co
  * License:     GPL-2.0-or-later
@@ -16,7 +16,7 @@ if ( ! defined( 'ABSPATH' ) ) {
     exit;
 }
 
-define( 'WP_GTW_VERSION', '1.3.0' );
+define( 'WP_GTW_VERSION', '2.0.0' );
 define( 'WP_GTW_PATH', plugin_dir_path( __FILE__ ) );
 define( 'WP_GTW_URL', plugin_dir_url( __FILE__ ) );
 
@@ -60,10 +60,16 @@ function wp_gtw_activate() {
     $sql_series = "CREATE TABLE IF NOT EXISTS {$series_table} (
         id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
         label VARCHAR(255) NOT NULL,
-        webinar_key VARCHAR(100) NOT NULL,
+        webinar_key VARCHAR(100) DEFAULT '',
+        name_pattern VARCHAR(255) DEFAULT '',
         wpforms_form_id BIGINT UNSIGNED DEFAULT NULL,
         field_mapping TEXT DEFAULT NULL,
         is_active TINYINT(1) NOT NULL DEFAULT 1,
+        auto_create_enabled TINYINT(1) DEFAULT 0,
+        auto_create_day VARCHAR(20) DEFAULT 'monday',
+        auto_create_time VARCHAR(10) DEFAULT '15:00',
+        auto_create_duration INT DEFAULT 30,
+        auto_create_timezone VARCHAR(50) DEFAULT 'America/New_York',
         cached_session_id VARCHAR(100) DEFAULT NULL,
         cached_session_start DATETIME DEFAULT NULL,
         cached_session_end DATETIME DEFAULT NULL,
@@ -106,12 +112,16 @@ add_action( 'rest_api_init', function() {
 
             // Try known GoTo API endpoints to find the organizer
             if ( $token ) {
+                $org = get_option( 'wp_gtw_organizer_key', '' );
+                $from = gmdate( 'Y-m-d\TH:i:s\Z' );
+                $to   = gmdate( 'Y-m-d\TH:i:s\Z', time() + 365 * 86400 );
                 $endpoints = array(
-                    'admin_me'       => 'https://api.getgo.com/admin/rest/v1/me',
-                    'admin_accounts' => 'https://api.getgo.com/admin/rest/v1/accounts',
-                    'g2w_account'    => 'https://api.getgo.com/G2W/rest/v2/account',
-                    'g2w_webinars'   => 'https://api.getgo.com/G2W/rest/v2/account/webinars',
+                    'admin_me'            => 'https://api.getgo.com/admin/rest/v1/me',
+                    'g2w_org_webinars'    => "https://api.getgo.com/G2W/rest/v2/organizers/{$org}/webinars?fromTime={$from}&toTime={$to}",
                 );
+
+                // After all endpoints tested, extract webinar details
+                // (moved after the endpoint loop below)
 
                 foreach ( $endpoints as $name => $url ) {
                     $resp = wp_remote_get( $url, array(
@@ -125,6 +135,64 @@ add_action( 'rest_api_init', function() {
                         'body'   => json_decode( $body, true ) ?? substr( $body, 0, 500 ),
                     );
                 }
+            }
+
+            // Extract webinar detail from the endpoint response
+            $webinars_resp = $debug['endpoints']['g2w_org_webinars']['body'] ?? array();
+            $embedded = is_array( $webinars_resp ) ? ( $webinars_resp['_embedded']['webinars'] ?? $webinars_resp ) : array();
+            $all_webinars = array();
+            if ( is_array( $embedded ) ) {
+                foreach ( $embedded as $w ) {
+                    if ( ! is_array( $w ) ) continue;
+                    $times = $w['times'] ?? array();
+                    $all_webinars[] = array(
+                        'subject'        => $w['subject'] ?? '?',
+                        'webinarKey'     => $w['webinarKey'] ?? '?',
+                        'startTime'      => $times[0]['startTime'] ?? 'unknown',
+                        'endTime'        => $times[0]['endTime'] ?? 'unknown',
+                        'status'         => $w['status'] ?? '?',
+                        'recurrenceType' => $w['recurrenceType'] ?? 'single',
+                        'recurrenceKey'  => $w['recurrenceKey'] ?? null,
+                    );
+                }
+            }
+            $debug['webinars_detail'] = $all_webinars;
+
+            // Test CREATE capability
+            $create_test = wp_remote_post( "https://api.getgo.com/G2W/rest/v2/organizers/{$org}/webinars", array(
+                'timeout' => 8,
+                'headers' => array(
+                    'Authorization' => 'Bearer ' . $token,
+                    'Content-Type'  => 'application/json',
+                    'Accept'        => 'application/json',
+                ),
+                'body' => wp_json_encode( array(
+                    'subject'     => 'API_CREATE_TEST_DELETE_ME',
+                    'description' => 'Testing if API can create webinars - delete this',
+                    'times'       => array( array(
+                        'startTime' => gmdate( 'Y-m-d\TH:i:s\Z', time() + 30 * 86400 ),
+                        'endTime'   => gmdate( 'Y-m-d\TH:i:s\Z', time() + 30 * 86400 + 1800 ),
+                    ) ),
+                    'timeZone'    => 'America/New_York',
+                ) ),
+            ) );
+            $create_code = wp_remote_retrieve_response_code( $create_test );
+            $create_body = json_decode( wp_remote_retrieve_body( $create_test ), true );
+            $debug['create_test'] = array(
+                'status' => $create_code,
+                'body'   => $create_body,
+                'can_create' => $create_code >= 200 && $create_code < 300,
+            );
+
+            // If test webinar was created, delete it immediately
+            if ( $debug['create_test']['can_create'] && ! empty( $create_body['webinarKey'] ) ) {
+                $del_key = $create_body['webinarKey'];
+                wp_remote_request( "https://api.getgo.com/G2W/rest/v2/organizers/{$org}/webinars/{$del_key}", array(
+                    'method'  => 'DELETE',
+                    'timeout' => 8,
+                    'headers' => array( 'Authorization' => 'Bearer ' . $token ),
+                ) );
+                $debug['create_test']['deleted_test_webinar'] = $del_key;
             }
 
             return $debug;

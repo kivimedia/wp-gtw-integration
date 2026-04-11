@@ -211,25 +211,54 @@ class GTW_API {
             return array( 'success' => false, 'error' => 'No access token. Connect to GoToWebinar first.' );
         }
 
-        $org_key = $this->get_organizer_key();
-        if ( empty( $org_key ) ) {
-            return array( 'success' => false, 'error' => 'No organizer key found. Reconnect to GoToWebinar.' );
+        // Use the admin /me endpoint which is confirmed to work
+        $response = wp_remote_get( 'https://api.getgo.com/admin/rest/v1/me', array(
+            'timeout' => 10,
+            'headers' => array( 'Authorization' => 'Bearer ' . $token, 'Accept' => 'application/json' ),
+        ) );
+
+        if ( is_wp_error( $response ) ) {
+            return array( 'success' => false, 'error' => $response->get_error_message() );
         }
 
-        $response = $this->api_get( "/organizers/{$org_key}" );
-        if ( $response['success'] ) {
+        $code = wp_remote_retrieve_response_code( $response );
+        $body = json_decode( wp_remote_retrieve_body( $response ), true );
+
+        if ( $code === 200 && ! empty( $body['email'] ) ) {
+            // Save organizer key if we got one
+            if ( ! empty( $body['key'] ) ) {
+                update_option( self::ORG_KEY, $body['key'] );
+            }
             return array(
                 'success' => true,
                 'data'    => array(
-                    'organizer_key' => $org_key,
-                    'email'         => $response['data']['email'] ?? 'Unknown',
-                    'first_name'    => $response['data']['firstName'] ?? '',
-                    'last_name'     => $response['data']['lastName'] ?? '',
+                    'organizer_key' => $body['key'] ?? $this->get_organizer_key(),
+                    'email'         => $body['email'] ?? 'Unknown',
+                    'first_name'    => $body['firstName'] ?? '',
+                    'last_name'     => $body['lastName'] ?? '',
                 ),
             );
         }
 
-        return $response;
+        return array( 'success' => false, 'error' => $body['message'] ?? $body['msg'] ?? "HTTP {$code}" );
+    }
+
+    /**
+     * Create a new webinar.
+     */
+    public function create_webinar( array $webinar_data ): array {
+        $org_key = $this->get_organizer_key();
+        if ( empty( $org_key ) ) {
+            return array( 'success' => false, 'error' => 'No organizer key' );
+        }
+        return $this->api_post( "/organizers/{$org_key}/webinars", $webinar_data );
+    }
+
+    /**
+     * Public wrapper for api_get (used by session resolver).
+     */
+    public function api_get_public( string $endpoint ): array {
+        return $this->api_get( $endpoint );
     }
 
     /**
@@ -238,9 +267,11 @@ class GTW_API {
     public function list_webinars(): array {
         $org_key = $this->get_organizer_key();
 
-        // Try with organizer key first
+        // Try with organizer key first (requires fromTime/toTime params)
         if ( ! empty( $org_key ) ) {
-            $response = $this->api_get( "/organizers/{$org_key}/webinars" );
+            $from = gmdate( 'Y-m-d\TH:i:s\Z' );
+            $to   = gmdate( 'Y-m-d\TH:i:s\Z', time() + 365 * 86400 );
+            $response = $this->api_get( "/organizers/{$org_key}/webinars?fromTime={$from}&toTime={$to}" );
             if ( $response['success'] ) {
                 return $this->parse_webinars_response( $response );
             }
@@ -263,7 +294,9 @@ class GTW_API {
             $fetched_key = $me_body['key'] ?? $me_body['organizerKey'] ?? '';
             if ( $fetched_key ) {
                 update_option( self::ORG_KEY, $fetched_key );
-                $response = $this->api_get( "/organizers/{$fetched_key}/webinars" );
+                $from = gmdate( 'Y-m-d\TH:i:s\Z' );
+                $to   = gmdate( 'Y-m-d\TH:i:s\Z', time() + 365 * 86400 );
+                $response = $this->api_get( "/organizers/{$fetched_key}/webinars?fromTime={$from}&toTime={$to}" );
                 if ( $response['success'] ) {
                     return $this->parse_webinars_response( $response );
                 }

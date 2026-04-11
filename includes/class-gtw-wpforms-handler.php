@@ -42,10 +42,22 @@ class GTW_WPForms_Handler {
             return;
         }
 
-        // Resolve the upcoming session
+        // Resolve the upcoming session - by name pattern (new) or webinar key (legacy)
         $api      = new GTW_API();
         $resolver = new GTW_Session_Resolver( $api );
-        $session  = $resolver->get_upcoming_session( $series['webinar_key'] );
+
+        $name_pattern = $series['name_pattern'] ?? '';
+        $webinar_key  = $series['webinar_key'] ?? '';
+
+        $auto_create = array(
+            'enabled'  => ! empty( $series['auto_create_enabled'] ),
+            'day'      => $series['auto_create_day'] ?? 'monday',
+            'time'     => $series['auto_create_time'] ?? '15:00',
+            'duration' => (int) ( $series['auto_create_duration'] ?? 30 ),
+            'timezone' => $series['auto_create_timezone'] ?? 'America/New_York',
+        );
+
+        $session = $resolver->get_upcoming_session( $webinar_key, $name_pattern, $auto_create );
 
         $full_name = trim( ( $registrant['firstName'] ?? '' ) . ' ' . ( $registrant['lastName'] ?? '' ) );
 

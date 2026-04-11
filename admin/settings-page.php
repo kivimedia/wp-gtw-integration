@@ -71,17 +71,23 @@ add_action( 'wp_ajax_wp_gtw_save_series', function() {
     $table = $wpdb->prefix . 'gtw_webinar_series';
 
     $data = array(
-        'label'          => sanitize_text_field( $_POST['label'] ?? 'Default Webinar' ),
-        'webinar_key'    => sanitize_text_field( $_POST['webinar_key'] ?? '' ),
-        'wpforms_form_id' => absint( $_POST['wpforms_form_id'] ?? 0 ),
-        'field_mapping'  => wp_json_encode( array(
+        'label'                => sanitize_text_field( $_POST['label'] ?? 'Default Webinar' ),
+        'webinar_key'          => sanitize_text_field( $_POST['webinar_key'] ?? '' ),
+        'name_pattern'         => sanitize_text_field( $_POST['name_pattern'] ?? '' ),
+        'wpforms_form_id'      => absint( $_POST['wpforms_form_id'] ?? 0 ),
+        'field_mapping'        => wp_json_encode( array(
             'firstName'    => sanitize_text_field( $_POST['map_first_name'] ?? '' ),
             'lastName'     => sanitize_text_field( $_POST['map_last_name'] ?? '' ),
             'email'        => sanitize_text_field( $_POST['map_email'] ?? '' ),
             'phone'        => sanitize_text_field( $_POST['map_phone'] ?? '' ),
             'organization' => sanitize_text_field( $_POST['map_organization'] ?? '' ),
         ) ),
-        'is_active'      => 1,
+        'is_active'            => 1,
+        'auto_create_enabled'  => ! empty( $_POST['auto_create_enabled'] ) ? 1 : 0,
+        'auto_create_day'      => sanitize_text_field( $_POST['auto_create_day'] ?? 'monday' ),
+        'auto_create_time'     => sanitize_text_field( $_POST['auto_create_time'] ?? '15:00' ),
+        'auto_create_duration' => absint( $_POST['auto_create_duration'] ?? 30 ),
+        'auto_create_timezone' => sanitize_text_field( $_POST['auto_create_timezone'] ?? 'America/New_York' ),
     );
 
     $series_id = absint( $_POST['series_id'] ?? 0 );
@@ -94,6 +100,59 @@ add_action( 'wp_ajax_wp_gtw_save_series', function() {
     }
 
     wp_send_json( array( 'success' => true, 'id' => $series_id ) );
+} );
+
+// Handle AJAX: get WPForms form fields for auto-mapping
+add_action( 'wp_ajax_wp_gtw_get_form_fields', function() {
+    check_ajax_referer( 'wp_gtw_nonce', 'nonce' );
+    if ( ! current_user_can( 'manage_options' ) ) wp_die( 'Unauthorized' );
+
+    $form_id = absint( $_POST['form_id'] ?? 0 );
+    if ( ! $form_id || ! function_exists( 'wpforms' ) ) {
+        wp_send_json( array( 'success' => false, 'error' => 'Invalid form ID or WPForms not active' ) );
+    }
+
+    $form = wpforms()->form->get( $form_id );
+    if ( ! $form ) {
+        wp_send_json( array( 'success' => false, 'error' => 'Form not found' ) );
+    }
+
+    $form_data = wpforms_decode( $form->post_content );
+    $fields = $form_data['fields'] ?? array();
+
+    $result = array( 'success' => true, 'fields' => array(), 'auto_map' => array() );
+
+    foreach ( $fields as $fid => $field ) {
+        $label = strtolower( $field['label'] ?? '' );
+        $type  = $field['type'] ?? '';
+        $result['fields'][] = array( 'id' => $fid, 'label' => $field['label'] ?? '', 'type' => $type );
+
+        // Auto-detect mapping by label and type
+        if ( $type === 'name' || strpos( $label, 'name' ) !== false ) {
+            if ( $type === 'name' ) {
+                // WPForms Name field has sub-fields (first/last)
+                if ( ! isset( $result['auto_map']['firstName'] ) ) {
+                    $result['auto_map']['firstName'] = (string) $fid;
+                    $result['auto_map']['lastName']  = (string) $fid;
+                }
+            } elseif ( strpos( $label, 'first' ) !== false ) {
+                $result['auto_map']['firstName'] = (string) $fid;
+            } elseif ( strpos( $label, 'last' ) !== false ) {
+                $result['auto_map']['lastName'] = (string) $fid;
+            }
+        }
+        if ( $type === 'email' || strpos( $label, 'email' ) !== false || strpos( $label, 'e-mail' ) !== false ) {
+            $result['auto_map']['email'] = (string) $fid;
+        }
+        if ( $type === 'phone' || strpos( $label, 'phone' ) !== false || strpos( $label, 'tel' ) !== false ) {
+            $result['auto_map']['phone'] = (string) $fid;
+        }
+        if ( strpos( $label, 'company' ) !== false || strpos( $label, 'organization' ) !== false || strpos( $label, 'business' ) !== false || strpos( $label, 'shop' ) !== false ) {
+            $result['auto_map']['organization'] = (string) $fid;
+        }
+    }
+
+    wp_send_json( $result );
 } );
 
 // Handle AJAX: list webinars from GTW account
@@ -208,16 +267,60 @@ function wp_gtw_settings_page() {
                     <td><input type="text" id="gtw-label" value="<?php echo esc_attr( $series['label'] ?? 'Weekly Webinar' ); ?>" class="regular-text" /></td>
                 </tr>
                 <tr>
-                    <th>Webinar Key (Series Key)</th>
+                    <th>Webinar Name Pattern</th>
                     <td>
-                        <input type="text" id="gtw-webinar-key" value="<?php echo esc_attr( $series['webinar_key'] ?? '' ); ?>" class="regular-text" />
+                        <input type="text" id="gtw-name-pattern" value="<?php echo esc_attr( $series['name_pattern'] ?? '' ); ?>" class="regular-text" placeholder="e.g. 30 in 30" />
                         <button type="button" class="button" id="gtw-list-webinars-btn" style="vertical-align:baseline;margin-left:8px;">Browse Webinars</button>
-                        <p class="description">The webinar key from GoToWebinar (not the session ID). Click "Browse Webinars" to pick from your account.</p>
+                        <p class="description">The plugin finds the soonest upcoming webinar whose name contains this text. No manual ID updates needed - it floats to the next matching session automatically.</p>
                         <div id="gtw-webinar-list" style="margin-top:10px;"></div>
+                    </td>
+                </tr>
+                <tr>
+                    <th>Webinar Key (optional)</th>
+                    <td>
+                        <input type="text" id="gtw-webinar-key" value="<?php echo esc_attr( $series['webinar_key'] ?? '' ); ?>" class="regular-text" placeholder="Leave empty if using name pattern" />
+                        <p class="description">Legacy: specific webinar key. Only needed if name pattern matching is not used.</p>
                     </td>
                 </tr>
             </table>
             <button class="button" id="gtw-refresh-btn">Refresh Sessions</button>
+
+            <h3 style="margin-top:20px;">Auto-Create Sessions</h3>
+            <p class="description">When no upcoming session matches the name pattern, the plugin can automatically create a new webinar session.</p>
+            <table class="form-table">
+                <tr>
+                    <th>Enable Auto-Create</th>
+                    <td><label><input type="checkbox" id="gtw-auto-create" <?php checked( $series['auto_create_enabled'] ?? 0 ); ?> /> Automatically create a new webinar when none is available</label></td>
+                </tr>
+                <tr>
+                    <th>Day of Week</th>
+                    <td>
+                        <select id="gtw-auto-day">
+                            <?php foreach ( array( 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday' ) as $d ) : ?>
+                                <option value="<?php echo $d; ?>" <?php selected( $series['auto_create_day'] ?? 'monday', $d ); ?>><?php echo ucfirst( $d ); ?></option>
+                            <?php endforeach; ?>
+                        </select>
+                    </td>
+                </tr>
+                <tr>
+                    <th>Time (local)</th>
+                    <td><input type="time" id="gtw-auto-time" value="<?php echo esc_attr( $series['auto_create_time'] ?? '15:00' ); ?>" /></td>
+                </tr>
+                <tr>
+                    <th>Duration (minutes)</th>
+                    <td><input type="number" id="gtw-auto-duration" value="<?php echo esc_attr( $series['auto_create_duration'] ?? 30 ); ?>" min="15" max="240" class="small-text" /></td>
+                </tr>
+                <tr>
+                    <th>Timezone</th>
+                    <td>
+                        <select id="gtw-auto-tz">
+                            <?php foreach ( array( 'America/New_York', 'America/Chicago', 'America/Denver', 'America/Los_Angeles', 'UTC' ) as $tz ) : ?>
+                                <option value="<?php echo $tz; ?>" <?php selected( $series['auto_create_timezone'] ?? 'America/New_York', $tz ); ?>><?php echo $tz; ?></option>
+                            <?php endforeach; ?>
+                        </select>
+                    </td>
+                </tr>
+            </table>
 
             <?php if ( ! empty( $series['cached_session_id'] ) ) : ?>
                 <div class="gtw-session-box">
@@ -308,6 +411,32 @@ function wp_gtw_settings_page() {
                 });
             });
 
+            // Auto-detect form field mapping on form selection change
+            $('#gtw-form-id').on('change', function() {
+                var formId = $(this).val();
+                if (!formId) return;
+                $.post(ajaxurl, { action: 'wp_gtw_get_form_fields', nonce: nonce, form_id: formId }, function(r) {
+                    if (!r.success) return;
+                    var map = r.auto_map || {};
+                    if (map.firstName) $('#gtw-map-first').val(map.firstName);
+                    if (map.lastName) $('#gtw-map-last').val(map.lastName);
+                    if (map.email) $('#gtw-map-email').val(map.email);
+                    if (map.phone) $('#gtw-map-phone').val(map.phone);
+                    if (map.organization) $('#gtw-map-org').val(map.organization);
+
+                    // Show detected fields below the form selector
+                    var html = '<div style="margin-top:8px;">';
+                    html += '<span class="gtw-status gtw-status-ok" style="font-size:12px;">Auto-detected ' + Object.keys(map).length + ' field(s)</span>';
+                    html += '<ul style="font-size:12px;margin:6px 0 0 16px;color:#555;">';
+                    (r.fields || []).forEach(function(f) {
+                        html += '<li>ID ' + f.id + ': ' + f.label + ' (' + f.type + ')</li>';
+                    });
+                    html += '</ul></div>';
+                    $('#gtw-form-fields-info').remove();
+                    $(html).attr('id', 'gtw-form-fields-info').insertAfter('#gtw-form-id');
+                });
+            });
+
             // Disconnect
             $('#gtw-disconnect-btn').on('click', function() {
                 if (!confirm('Disconnect from GoToWebinar? You will need to reconnect to resume registrations.')) return;
@@ -330,16 +459,36 @@ function wp_gtw_settings_page() {
                         $('#gtw-webinar-list').html('<span class="gtw-status gtw-status-pending">No webinars found on this account</span>');
                         return;
                     }
-                    var html = '<table class="widefat striped" style="max-width:600px;"><thead><tr><th>Webinar</th><th>Key</th><th></th></tr></thead><tbody>';
+                    var html = '<table class="widefat striped" style="max-width:800px;"><thead><tr><th>Webinar</th><th>Date</th><th>Type</th><th>Key</th><th></th></tr></thead><tbody>';
                     webinars.forEach(function(w) {
-                        html += '<tr><td>' + w.subject + '</td><td style="font-family:monospace;font-size:12px;">' + w.webinarKey + '</td>';
-                        html += '<td><button type="button" class="button button-small gtw-pick-webinar" data-key="' + w.webinarKey + '">Use This</button></td></tr>';
+                        var times = w.times || [];
+                        var dateStr = times.length ? new Date(times[0].startTime).toLocaleDateString('en-US', {month:'short', day:'numeric', year:'numeric', hour:'numeric', minute:'2-digit'}) : 'N/A';
+                        var type = (w.recurrenceType || 'single').replace('_', ' ');
+                        var shortSubject = w.subject.length > 50 ? w.subject.substring(0, 50) + '...' : w.subject;
+                        // Extract a name pattern from the subject (first phrase before |)
+                        var namePattern = w.subject.split('|')[0].trim();
+                        if (namePattern.length > 40) namePattern = namePattern.substring(0, 40);
+                        html += '<tr>';
+                        html += '<td title="' + w.subject.replace(/"/g, '&quot;') + '">' + shortSubject + '</td>';
+                        html += '<td style="white-space:nowrap;font-size:12px;">' + dateStr + '</td>';
+                        html += '<td><span style="font-size:11px;padding:2px 6px;border-radius:3px;background:' + (type === 'series' ? '#d4edda' : type === 'sequence' ? '#fff3cd' : '#e2e3e5') + ';">' + type + '</span></td>';
+                        html += '<td style="font-family:monospace;font-size:11px;">' + w.webinarKey.substring(0, 12) + '...</td>';
+                        html += '<td>';
+                        html += '<button type="button" class="button button-small gtw-pick-pattern" data-pattern="' + namePattern.replace(/"/g, '&quot;') + '" style="margin-right:4px;">Use Name</button>';
+                        html += '<button type="button" class="button button-small gtw-pick-webinar" data-key="' + w.webinarKey + '">Use Key</button>';
+                        html += '</td></tr>';
                     });
                     html += '</tbody></table>';
+                    html += '<p style="font-size:12px;color:#666;margin-top:8px;"><strong>Use Name</strong> = floating match (recommended for recurring). <strong>Use Key</strong> = exact webinar (legacy).</p>';
                     $('#gtw-webinar-list').html(html);
+                    $('.gtw-pick-pattern').on('click', function() {
+                        $('#gtw-name-pattern').val($(this).data('pattern'));
+                        $('#gtw-webinar-key').val('');
+                        $('#gtw-webinar-list').html('<span class="gtw-status gtw-status-ok">Pattern set: "' + $(this).data('pattern') + '" - will match the soonest upcoming webinar with this name</span>');
+                    });
                     $('.gtw-pick-webinar').on('click', function() {
                         $('#gtw-webinar-key').val($(this).data('key'));
-                        $('#gtw-webinar-list').html('<span class="gtw-status gtw-status-ok">Selected: ' + $(this).data('key') + '</span>');
+                        $('#gtw-webinar-list').html('<span class="gtw-status gtw-status-ok">Key set: ' + $(this).data('key') + '</span>');
                     });
                 });
             });
@@ -365,12 +514,18 @@ function wp_gtw_settings_page() {
                     series_id: $('#gtw-series-id').val(),
                     label: $('#gtw-label').val(),
                     webinar_key: $('#gtw-webinar-key').val(),
+                    name_pattern: $('#gtw-name-pattern').val(),
                     wpforms_form_id: $('#gtw-form-id').val(),
                     map_first_name: $('#gtw-map-first').val(),
                     map_last_name: $('#gtw-map-last').val(),
                     map_email: $('#gtw-map-email').val(),
                     map_phone: $('#gtw-map-phone').val(),
                     map_organization: $('#gtw-map-org').val(),
+                    auto_create_enabled: $('#gtw-auto-create').is(':checked') ? 1 : 0,
+                    auto_create_day: $('#gtw-auto-day').val(),
+                    auto_create_time: $('#gtw-auto-time').val(),
+                    auto_create_duration: $('#gtw-auto-duration').val(),
+                    auto_create_timezone: $('#gtw-auto-tz').val(),
                 }, function(r) {
                     if (r.success) {
                         $('#gtw-series-id').val(r.id);
