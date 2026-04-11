@@ -266,13 +266,28 @@ add_action( 'wp_ajax_wp_gtw_disconnect', function() {
  */
 function wp_gtw_settings_page() {
     // Handle OAuth callback (GoTo redirects back with ?code=...)
+    // Only process the code ONCE - redirect to clean URL after processing
     if ( isset( $_GET['code'] ) && ! empty( $_GET['code'] ) ) {
         $api = new GTW_API();
-        $success = $api->exchange_code( sanitize_text_field( $_GET['code'] ) );
-        if ( $success ) {
-            echo '<div class="notice notice-success"><p><strong>Connected to GoToWebinar successfully!</strong></p></div>';
+        if ( ! $api->is_connected() ) {
+            $success = $api->exchange_code( sanitize_text_field( $_GET['code'] ) );
+            // Redirect to clean URL to prevent re-processing on refresh
+            $clean_url = admin_url( 'options-general.php?page=wp-gtw-settings&gtw_connected=' . ( $success ? '1' : '0' ) );
+            wp_redirect( $clean_url );
+            exit;
         } else {
-            echo '<div class="notice notice-error"><p><strong>Failed to connect.</strong> Check your Client ID and Secret, then try again.</p></div>';
+            // Already connected - redirect to clean URL without reprocessing
+            wp_redirect( admin_url( 'options-general.php?page=wp-gtw-settings&gtw_connected=1' ) );
+            exit;
+        }
+    }
+
+    // Show connection result after redirect
+    if ( isset( $_GET['gtw_connected'] ) ) {
+        if ( $_GET['gtw_connected'] === '1' ) {
+            echo '<div class="notice notice-success is-dismissible"><p><strong>Connected to GoToWebinar successfully!</strong></p></div>';
+        } else {
+            echo '<div class="notice notice-error is-dismissible"><p><strong>Failed to connect.</strong> Check your Client ID and Secret, then try again.</p></div>';
         }
     }
 
